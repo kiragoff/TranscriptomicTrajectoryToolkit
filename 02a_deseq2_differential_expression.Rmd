@@ -1,0 +1,624 @@
+---
+title: "deseq2_main_analysis"
+author: "Kira Goff"
+date: "2026-05-25"
+output: html_document
+---
+
+# 1. Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r load-libraries}
+library(DESeq2)
+
+library(dplyr)
+library(tibble)
+library(readr)
+library(here)
+library(ggplot2)
+library(apeglm)
+
+library(pheatmap)
+library(ComplexUpset)
+library(EnhancedVolcano)
+library(pcaExplorer)
+```
+
+
+```{r define-directories}
+base_dir <- "./"
+import_dir <- "./kallisto"
+results_dir <- "./results"
+```
+
+
+
+# 2. Import Data
+
+NOTE: Ideally, use tximport to import your transcript-level abundances.
+The system I'm working on has long-standing libcairo issues that impact ragg and R packages that use it as a downstream dependency.
+
+```{r import-kallisto}
+
+colData <- read.csv(file.path(base_dir,"meta.csv"), header = TRUE, sep = ",")
+
+# Get list of subfolders
+sample_folders <- list.dirs(import_dir, full.names = TRUE, recursive = FALSE)
+count_list <- list()
+
+# Loop over data
+for (folder in sample_folders) {
+  sample_name <- basename(folder)
+  tsv_file <- file.path(folder, "abundance.tsv")
+  df <- read.delim(tsv_file, stringsAsFactors = FALSE)
+  df <- df %>% select(target_id, est_counts)
+
+  # est_counts to integers so DESeq2 doesn't throw a hissy
+  df$est_counts <- round(df$est_counts)
+
+  colnames(df)[2] <- sample_name
+  count_list[[sample_name]] <- df
+}
+
+# Merge all 24 dataframes by target_id
+countData <- Reduce(function(x, y) merge(x, y, by = "target_id"), count_list)
+countData <- countData %>% select(target_id, everything())
+
+write.table(countData, file.path(results_dir,"countDataAll.tsv"), sep = "\t", row.names = FALSE, quote = FALSE)
+
+# Keep only rows where target_id starts with "P"
+countData <- countData[grepl("^P", countData$target_id), ]
+
+write.table(countData, file.path(results_dir,"countDataPeri.tsv"), sep = "\t", row.names = FALSE, quote = FALSE)
+
+# Set target_id as row names
+rownames(countData) <- countData$target_id
+countData$target_id <- NULL
+
+head(countData)
+```
+
+
+```{r import-annotations}
+# Combination of annotations was done using my annotation-integration.Rmd script
+
+peri_anno <- read_tsv(file.path(base_dir,"peri-anno-definitions.tsv"))
+
+# trim to what you want
+anno_operon <- peri_anno[, c(1, 2, 9, 10, 11, 14, 15, 36, 12, 13, 27, 28, 25, 26, 29, 30, 20)]
+```
+
+
+
+# 3. Global Modeling
+
+## 3.1 Process Data
+
+```{r make-peri-object}
+dds <- DESeqDataSetFromMatrix(
+  countData = countData,
+  colData = colData,
+  design = ~ time + exposure + time:exposure
+)
+```
+
+
+```{r global-models}
+dds_full <- dds
+design(dds_full) <- ~ time + exposure + time:exposure
+dds_full <- DESeq(dds_full)
+
+dds_full_lrt <- DESeq(
+  dds,
+  test = "LRT",
+  reduced = ~ time + exposure
+)
+```
+
+
+```{r variance-stabilization-full}
+vsd_full <- vst(dds_full, blind = FALSE)
+```
+
+
+## 3.2 QC and Visualization
+
+```{r pca-explorer-full}
+pcaExplorer(dds_full)
+```
+
+If you'd rather not use pcaExplorer:
+```{r pca-full}
+plotPCA(vsd_full)
+```
+
+```{r disp-est-full}
+plotDispEsts(dds_full)
+```
+
+```{r disp-est-vst-full}
+plotDispEsts(vsd_full)
+```
+
+```{r}
+sample_dists <- dist(t(assay(vsd_full)))
+
+pheatmap(
+  as.matrix(sample_dists),
+  annotation_col = as.data.frame(
+    colData(dds_full)[, c("time", "exposure")]
+  )
+)
+```
+
+
+```{r heatmap}
+# Significant genes from LRT
+res_full_lrt <- results(dds_full_lrt)
+
+sig_genes <- rownames(
+  subset(res_full_lrt, padj < 0.05)
+)
+
+vsd_sig <- vsd_full[sig_genes, ]
+
+mat <- assay(vsd_sig)
+
+# Row scaling
+mat <- t(scale(t(mat)))
+
+pheatmap(
+  mat,
+  show_rownames = FALSE,
+  cluster_cols = TRUE,
+  annotation_col = as.data.frame(
+    colData(dds_full)[, c("time", "exposure")]
+  )
+)
+```
+
+# 4. Targeted Analysis of 06h and 24h
+
+In this case, the gene expression at 72 hours is starkly different than at 06h or 24h.
+
+At 72h:
+- much of the CHCA has been degraded
+- the Peribacillus is making endospores
+- the % of the reads coming from Peribacillus is ~20%
+
+
+## 4.1 Process Data
+
+```{r make-object-0624}
+
+dds_06_24 <- dds[, dds$time != "72h"]
+colData(dds_06_24) <- droplevels(colData(dds_06_24))
+design(dds_06_24) <- ~ time + exposure + time:exposure
+dds_06_24 <- DESeq(dds_06_24)
+```
+
+
+```{r variance-stabilization-0624}
+vsd_06_24 <- vst(dds_06_24, blind = FALSE)
+```
+
+
+## 4.2 QC and Visualization
+
+```{r pca-explorer-0624}
+pcaExplorer(dds_06_24)
+```
+
+If you'd rather not use pcaExplorer:
+```{r pca-Exp-vsd-0624}
+plotPCA(vsd_06_24)
+```
+
+```{r disp-est-0624}
+plotDispEsts(dds_06_24)
+```
+
+
+## 4.3 Extract Results
+
+```{r get-contrasts}
+# Time
+res_time <- lfcShrink(
+  dds_06_24,
+  coef = "time_24h_vs_06h",
+  type = "apeglm"
+)
+# Exposure
+res_exposure <- lfcShrink(
+  dds_06_24,
+  coef = "exposure_Exposed_vs_Control",
+  type = "apeglm"
+)
+
+# Time: Exposure Interaction
+res_interaction <- lfcShrink(
+  dds_06_24,
+  coef = "time24h.exposureExposed",
+  type = "apeglm"
+)
+
+```
+
+```{r sig-results-0624}
+sig_time <- rownames(res_time)[which(res_time$padj < 0.05)]
+
+sig_exposure <- rownames(res_exposure)[which(res_exposure$padj < 0.05)]
+
+sig_interaction <- rownames(res_interaction)[which(res_interaction$padj < 0.05)]
+```
+
+
+```{r summarize-contrasts}
+get_sig_count <- function(res, alpha = 0.05) {
+  sum(res$padj < alpha, na.rm = TRUE)
+}
+
+summary_tbl <- tibble(
+  model_term = c("time", "exposure", "interaction"),
+  significant_genes = c(
+    get_sig_count(res_time),
+    get_sig_count(res_exposure),
+    get_sig_count(res_interaction)
+  )
+)
+```
+
+
+```{r export-results-0624}
+write_csv(
+  as.data.frame(res_time) %>%
+    rownames_to_column("gene_id"),
+  file.path(results_dir, "res_time.csv")
+)
+
+write_csv(
+  as.data.frame(res_exposure) %>%
+    rownames_to_column("gene_id"),
+  file.path(results_dir, "res_exposure.csv")
+)
+
+write_csv(
+  as.data.frame(res_interaction) %>%
+    rownames_to_column("gene_id"),
+  file.path(results_dir, "res_interaction.csv")
+)
+```
+
+
+## 4.4 Visualize Results
+
+```{r volcano-plots-0624}
+alpha <- 0.05
+lfc_cutoff <- 1
+contrast_set <- res_interaction
+
+contrast_name <- deparse(substitute(contrast_set))
+save <- sprintf("volcano-%s-qval_%g-lfc_%g.png", contrast_name, alpha, lfc_cutoff)
+
+ev <- EnhancedVolcano(
+  contrast_set,
+  lab = rownames(contrast_set),
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = alpha,
+  FCcutoff = lfc_cutoff,
+  selectLab = NULL
+)
+ggsave (file.path(results_dir,save))
+
+
+```
+
+
+```{r volcano-0624}
+# variables
+alpha <- 0.05
+lfc_cutoff <- 1
+contrast_set <- res_exposure
+contrast_name <- "res_exposure"
+headline <- "06h and 24h Model"
+subhead <- "Contrast - Exposure"
+#
+
+save <- sprintf("volcano-%s-qval_%g-lfc_%g.png", contrast_name, alpha, lfc_cutoff)
+
+ev <- EnhancedVolcano(
+  contrast_df,
+  lab = rep("", nrow(contrast_df)),
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = alpha,
+  FCcutoff = lfc_cutoff,
+  # for whatever reason, Enhanced Volcano is using p unless you do a manual overwrite of legend labels
+  legendLabels = c(
+    "NS",
+    "Log2 FC",
+    "q-value",
+    "q-value & Log2FC"
+  ),
+  ylab = "-log10 q",
+  xlab = "Log2FC",
+  title = headline,
+  subtitle = subhead
+)
+
+ggsave(filename = file.path(results_dir, save))
+```
+
+
+
+
+```{r ma-0624}
+plotMA(
+  res_time,
+  ylim = c(-5, 5),
+  main = "Time Effect"
+)
+
+plotMA(
+  res_exposure,
+  ylim = c(-5, 5),
+  main = "Exposure Effect"
+)
+
+plotMA(
+  res_interaction,
+  ylim = c(-5, 5),
+  main = "Interaction Effect"
+)
+```
+
+## 4.5 Visualize Contrast Effects
+
+```{r summarize-contrasts}
+all_genes <- rownames(res_time)
+padj_df <- data.frame(gene = rownames(res_time)) %>%
+  mutate(
+    padj_time          = res_time$padj,
+    log2FC_time        = res_time$log2FoldChange,
+    padj_exposure      = res_exposure$padj,
+    log2FC_exposure    = res_exposure$log2FoldChange,
+    padj_interaction   = res_interaction$padj,
+    log2FC_interaction = res_interaction$log2FoldChange
+  )
+
+padj_df <- padj_df %>%
+  rowwise() %>%
+  mutate(
+    best_term = {
+      vals <- c(time = padj_time, exposure = padj_exposure, interaction = padj_interaction)
+      vals <- vals[!is.na(vals)]
+      if (length(vals) == 0) NA_character_ else names(vals)[which.min(vals)]
+    }
+  ) %>%
+  ungroup()
+
+write_tsv(padj_df, file.path(results_dir,"fullmodel_06h24h_byterm.tsv"))
+```
+
+```{r best-model-term}
+term_counts <- padj_df %>%
+  filter(!is.na(best_term)) %>% # ignore remaining NAs
+  group_by(best_term) %>%
+  summarise(count = n())
+
+# Plot
+ggplot(term_counts, aes(x = best_term, y = count, fill = best_term)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Genes by Most Significant Term",
+    x = "Best Term",
+    y = "Number of Genes"
+  ) +
+  scale_fill_brewer(palette = "Set2")
+
+ggsave(file.path(results_dir,"bargraph-terms.png"))
+```
+
+```{r upset-sig-terms}
+gene_lists <- list(
+  Time = sig_time,
+  Exposure = sig_exposure,
+  Interaction = sig_interaction
+)
+
+# Create a binary matrix
+upset_df <- tibble(gene = all_genes) %>%
+  mutate(
+    Time = gene %in% sig_time,
+    Exposure = gene %in% sig_exposure,
+    Interaction = gene %in% sig_interaction
+  )
+
+
+upset(upset_df, intersect = c("Time", "Exposure", "Interaction"))
+
+ggsave(file.path(results_dir,"upset-terms.png"))
+```
+
+# 5. 06h Control/Exposure Comparison
+
+```{r make-06h}
+dds_06h <- dds[, dds$time == "06h"]
+# Drop unused factor levels
+colData(dds_06h) <- droplevels(
+  colData(dds_06h)
+)
+```
+
+
+```{r model-06h}
+design(dds_06h) <- ~ exposure
+
+dds_06h <- DESeq(dds_06h)
+
+res_06h_exposure <- lfcShrink(
+  dds_06h,
+  coef = "exposure_Exposed_vs_Control",
+  type = "apeglm"
+)
+
+write_csv(
+  as.data.frame(res_06h_exposure) %>%
+    rownames_to_column("gene_id"),
+  file.path(results_dir, "res_06h_exposure.csv")
+)
+
+```
+
+
+
+```{r variance-stabilization-0624}
+vsd_06h <- vst(dds_06h, blind = FALSE)
+```
+
+
+```{r pca-explorer-06}
+pcaExplorer(dds_06h)
+```
+
+If you'd rather not use pcaExplorer:
+```{r pca-Exp-vsd-06}
+plotPCA(vsd_06h)
+```
+
+
+```{r volcano-06}
+# variables
+alpha <- 0.05
+lfc_cutoff <- 1
+contrast_set <- res_06h_exposure
+contrast_name <- "res_06h_exposure"
+headline <- "06h Control:Exposure"
+#
+
+save <- sprintf("volcano-%s-qval_%g-lfc_%g.png", contrast_name, alpha, lfc_cutoff)
+
+ev <- EnhancedVolcano(
+  contrast_df,
+  lab = rep("", nrow(contrast_df)),
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = alpha,
+  FCcutoff = lfc_cutoff,
+  # for whatever reason, Enhanced Volcano is using p unless you do a manual overwrite of legend labels
+  legendLabels = c(
+    "NS",
+    "Log2 FC",
+    "q-value",
+    "q-value & Log2FC"
+  ),
+  ylab = "-log10 q",
+  xlab = "Log2FC",
+  title = headline,
+  subtitle=""
+)
+
+ev
+
+ggsave(filename = file.path(results_dir, save))
+```
+
+
+# 6. 24h Control/Exposure Comparison
+
+```{r make-24h}
+dds_24h <- dds[, dds$time == "24h"]
+# Drop unused factor levels
+colData(dds_24h) <- droplevels(
+  colData(dds_24h)
+)
+```
+
+
+```{r model-24h}
+design(dds_24h) <- ~ exposure
+
+dds_24h <- DESeq(dds_24h)
+
+res_24h_exposure <- lfcShrink(
+  dds_24h,
+  coef = "exposure_Exposed_vs_Control",
+  type = "apeglm"
+)
+
+write_csv(
+  as.data.frame(res_24h_exposure) %>%
+    rownames_to_column("gene_id"),
+  file.path(results_dir, "res_24h_exposure.csv")
+)
+
+```
+
+
+```{r variance-stabilization-2424}
+vsd_24h <- vst(dds_24h, blind = FALSE)
+```
+
+
+```{r pca-explorer-24}
+pcaExplorer(dds_24h)
+```
+
+If you'd rather not use pcaExplorer:
+```{r pca-Exp-vsd-24}
+plotPCA(vsd_24h)
+```
+
+
+
+
+```{r volcano-24}
+# variables
+alpha <- 0.05
+lfc_cutoff <- 1
+contrast_set <- res_24h_exposure
+contrast_name <- "res_24h_exposure"
+headline <- "24h Control:Exposure"
+#
+
+save <- sprintf("volcano-%s-qval_%g-lfc_%g.png", contrast_name, alpha, lfc_cutoff)
+
+ev <- EnhancedVolcano(
+  contrast_df,
+  lab = rep("", nrow(contrast_df)),
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = alpha,
+  FCcutoff = lfc_cutoff,
+  # for whatever reason, Enhanced Volcano is using p unless you do a manual overwrite of legend labels
+  legendLabels = c(
+    "NS",
+    "Log2 FC",
+    "q-value",
+    "q-value & Log2FC"
+  ),
+  ylab = "-log10 q",
+  xlab = "Log2FC",
+  title = headline,
+  subtitle=""
+)
+
+ev
+
+ggsave(filename = file.path(results_dir, save))
+```
+
+
+
+```{r}
+sessionInfo()
+```
