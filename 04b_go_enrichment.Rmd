@@ -1,0 +1,1507 @@
+---
+title: "deseq2-split3b-GO-clustering"
+author: "Kira Goff"
+date: "2026-06-05"
+output: html_document
+---
+
+# R setup
+
+```{r setup, message=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)          # Grammar of data manipulation
+library(tidyr)          # Data reshaping and pivoting (pivot_wider/expand_grid)
+library(stringr)        # Robust regex and text filtering (str_detect)
+library(purrr)          # Functional programming and list iteration
+library(tidytext)       # Text mining and word tokenization for word clouds
+
+
+library(topGO)          # Parent enrichment engine (elim/weight algorithms)
+library(clusterProfiler) # Functional profile comparison & enrichment workflows
+library(AnnotationDbi)  # Core database interface for gene annotations
+library(GO.db)          # Metadata mapping for Gene Ontology structural trees
+
+
+library(ComplexHeatmap) # Bi-clustered matrix heatmaps (Figure 3)
+library(circlize)       # Required for ComplexHeatmap precise color mapping (colorRamp2)
+
+
+library(ggplot2)        # Core plotting framework
+library(enrichplot)     # Visualization tools for clusterProfiler objects (cnetplot layout)
+library(ggwordcloud)    # Spatial word cloud engine with text anti-collision
+library(ggdendro)       # Extracts data trees into standard ggplot segments
+library(tidygraph)      # Tidy framework for structural network data (tbl_graph)
+library(ggraph)         # Network graph layouts (stress/force-directed structures)
+library(patchwork)      # Combines multiple plots into grids (Tree-Heatmap layouts)
+```
+
+
+```{r}
+results_dir <- "/mnt/work-drive/kira/deseq2New/final-split"
+```
+
+
+#GO enrichment, specifically, because we have to fetch terms instead of reading from tsv
+
+```{r !!!go-enrichment}
+# ----- define variables -----
+qtable <- 0.6 # q threshold for out table
+ptable <- 0.2 # p threshold for out table
+clust_thresh <- 0.25 # cluster membership threshold
+
+target_db <- "GO_bak"
+
+
+# Define background from detectable genes
+raw_universe_genes <- rownames(dds)
+
+# ----- mapping and enrichment -----
+
+# Map genes to GO terms
+t2g <- anno_operon_clean %>%
+  filter(Gene %in% raw_universe_genes) %>%
+  # Use dplyr:: explicitly here
+  dplyr::select(!!sym(target_db), Gene) %>%
+  drop_na(!!sym(target_db)) %>%
+  separate_rows(!!sym(target_db), sep = ", ") %>%
+  filter(!!sym(target_db) != "" & !!sym(target_db) != "NA") %>%
+  rename(term_id = !!sym(target_db), gene_id = Gene) %>%
+  distinct()
+universe_vector <- unique(t2g$gene_id)
+
+# Run enrichment
+cluster_input <- df_final_clusters %>%
+  filter(is_driver == "High-Confidence" & Gene %in% universe_vector)
+#filter(membership_score >= clust_thresh & Gene %in% universe_vector)
+  
+all_clusters <- sort(unique(cluster_input$cluster))
+enrich_list <- list()
+
+message("Starting GO Enrichment for ", length(all_clusters), " clusters...")
+
+for (clust_id in all_clusters) {
+  current_genes <- cluster_input %>%
+    filter(cluster == clust_id) %>%
+    pull(Gene)
+
+  ego <- enricher(
+    gene         = current_genes,
+    universe     = universe_vector,
+    TERM2GENE    = t2g,
+    pvalueCutoff = ptable,
+    qvalueCutoff = qtable,
+    minGSSize    = 2
+  )
+
+  if (!is.null(ego) && nrow(ego@result) > 0) {
+    enrich_list[[as.character(clust_id)]] <- as.data.frame(ego) %>%
+      mutate(Analysis_Group = paste0("Cluster_", clust_id))
+  }
+}
+
+# ----- make it sensible -----
+# lookup term definitions
+library(GO.db)
+
+if (length(enrich_list) > 0) {
+  all_go_res <- bind_rows(enrich_list)
+  unique_go_ids <- unique(all_go_res$ID)
+
+  message("Mapping metadata for ", length(unique_go_ids), " unique GO terms...")
+
+  # Explicitly use AnnotationDbi for the database query
+  go_metadata_df <- AnnotationDbi::select(
+    x       = GO.db,
+    keys    = unique_go_ids,
+    columns = c("GOID", "TERM", "DEFINITION"),
+    keytype = "GOID"
+  ) %>%
+    dplyr::rename(ID = GOID, GO_Name = TERM, GO_Definition = DEFINITION)
+
+# merge and save
+  final_go_df <- all_go_res %>%
+    dplyr::left_join(go_metadata_df, by = "ID")
+
+  # Force-verify that geneID exists before dropping columns, 
+  # or find its exact spelling if clusterProfiler output changed.
+  if (!"geneID" %in% colnames(final_go_df) & "gene_id" %in% colnames(final_go_df)) {
+    final_go_df <- final_go_df %>% dplyr::rename(geneID = gene_id)
+  }
+
+  final_go_df <- final_go_df %>%
+    dplyr::select(
+      dplyr::any_of(c(
+        "Analysis_Group","GO_Name", "ID", "GO_Definition",
+        "Count", "GeneRatio", "BgRatio", "pvalue",
+        "p.adjust", "qvalue", "geneID"
+      ))
+    )
+
+  # Save locally
+  if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+  out_path = file.path(results_dir, "go_anno_cluster_results.csv")
+  write.csv(final_go_df, out_path, row.names = FALSE)
+
+  message("GO Analysis complete. File saved to: ", out_path)
+} else {
+  message("No significant GO enrichment found for these clusters.")
+}
+
+# RESET NAMESPACE,
+# Force R to point 'select' and 'filter' back to dplyr
+select <- dplyr::select
+filter <- dplyr::filter
+
+message("Namespace reset: 'select' and 'filter' now point back to dplyr.")
+```
+
+
+```{r bubble-plot-all-clusters}
+# ----- define variables -----
+qtable <- 0.3          # q threshold for output filtering
+ptable <- 0.05         # p threshold for output filtering
+clust_thresh <- 0.25   # cluster membership threshold
+target_db <- "GO_bak"
+
+# Define background universe from detectable genes
+raw_universe_genes <- rownames(dds)
+
+# ----- mapping -----
+
+# Map background genes to custom GO terms
+t2g <- anno_operon_clean %>%
+  filter(Gene %in% raw_universe_genes) %>%
+  dplyr::select(!!sym(target_db), Gene) %>%
+  drop_na(!!sym(target_db)) %>%
+  separate_rows(!!sym(target_db), sep = ", ") %>%
+  filter(!!sym(target_db) != "" & !!sym(target_db) != "NA") %>%
+  rename(term_id = !!sym(target_db), gene_id = Gene) %>%
+  distinct()
+
+universe_vector <- unique(t2g$gene_id)
+
+# Build a comprehensive TERM2NAME mapping table from GO.db
+message("Building global GO term-to-name lookup table...")
+all_go_ids_in_universe <- unique(t2g$term_id)
+
+t2n <- AnnotationDbi::select(
+  x       = GO.db,
+  keys    = all_go_ids_in_universe,
+  columns = c("GOID", "TERM"),
+  keytype = "GOID"
+) %>%
+  dplyr::rename(term_id = GOID, term_name = TERM) %>%
+  distinct()
+
+# Filter target driver genes present in our background universe
+cluster_input <- df_final_clusters %>%
+  filter(is_driver == "High-Confidence" & Gene %in% universe_vector)
+
+# ----- simultaneous cluster enrichment -----
+message("Splitting genes into cluster list and initiating compareCluster...")
+
+# Format clusters into a clean, named list of gene vectors to avoid splitting errors
+gene_list_by_cluster <- split(cluster_input$Gene, cluster_input$cluster)
+
+# Run comparative enrichment across all groups concurrently
+comp_ego <- compareCluster(
+  geneClusters = gene_list_by_cluster, 
+  fun          = "enricher", 
+  universe     = universe_vector,
+  TERM2GENE    = t2g,
+  TERM2NAME    = t2n,
+  pvalueCutoff = ptable,
+  qvalueCutoff = qtable
+)
+
+# ----- CORRECTED ONTOLOGY PATCH ---
+# Use attr() since 'ontology' is a core metadata attribute for compareClusterResult
+attr(comp_ego, "ontology") <- "BP"
+
+# ----- similarity matrix ----- 
+message("Calculating global semantic similarity matrix via Jaccard Coefficient...")
+
+# Calculate overlapping gene similarities across the whole uncollapsed dataset
+comp_ego_sim <- pairwise_termsim(comp_ego, method = "JC", semData = NULL)
+
+# ----- Visualization -----
+message("Collapsing redundant terms and plotting master comparative dotplot...")
+
+suppressWarnings({
+  # showCategory = 5 groups hundreds of terms into modules, displaying the top 5 per cluster
+  p_compare <- dotplot(comp_ego_sim, x = "Cluster", showCategory = 5) +
+    labs(
+      title = "Functional Mapping Across Analysis Groups",
+      subtitle = "Redundant terms collapsed dynamically; top modules compared side-by-side",
+      x = "Analysis Group (Cluster)",
+      y = "Enriched Functional Module"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      axis.text.y = element_text(fontsize = 9),
+      plot.title = element_text(face = "bold", size = 14)
+    )
+
+  # Ensure the results folder exists and write the comparative plot
+  if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+  
+  out_plot_path <- file.path(results_dir, "all_clusters_compared_dotplot.png")
+  ggsave(
+    filename = out_plot_path,
+    plot = p_compare, 
+    width = 15, 
+    height = 12, 
+    dpi = 300
+  )
+})
+
+
+message("Success! Master comparative bubble plot saved to: ", out_plot_path)
+
+print(p_compare)
+
+# ------ reset pointers -----
+select <- dplyr::select
+filter <- dplyr::filter
+message("Namespace reset: 'select' and 'filter' point back to dplyr.")
+```
+
+Let's look at the drivers per cluster
+
+```{r !!!go-enrichment-semantic-terminology-sep-trees}
+# ----- define variables -----
+qtable <- 0.3          # q threshold for out table
+ptable <- 0.05         # p threshold for out table
+clust_thresh <- 0.25   # cluster membership threshold
+target_db <- "GO_bak"
+
+raw_universe_genes <- rownames(dds)
+
+# ----- mapping -----
+
+t2g <- anno_operon_clean %>%
+  filter(Gene %in% raw_universe_genes) %>%
+  dplyr::select(!!sym(target_db), Gene) %>%
+  drop_na(!!sym(target_db)) %>%
+  separate_rows(!!sym(target_db), sep = ", ") %>%
+  filter(!!sym(target_db) != "" & !!sym(target_db) != "NA") %>%
+  rename(term_id = !!sym(target_db), gene_id = Gene) %>%
+  distinct()
+
+universe_vector <- unique(t2g$gene_id)
+
+message("Building GO ID to Term Name mapping table...")
+all_go_ids_in_universe <- unique(t2g$term_id)
+
+t2n <- AnnotationDbi::select(
+  x       = GO.db,
+  keys    = all_go_ids_in_universe,
+  columns = c("GOID", "TERM"),
+  keytype = "GOID"
+) %>%
+  dplyr::rename(term_id = GOID, term_name = TERM) %>%
+  distinct()
+
+# Prepare cluster inputs
+cluster_input <- df_final_clusters %>%
+  filter(is_driver == "High-Confidence" & Gene %in% universe_vector)
+
+all_clusters <- sort(unique(cluster_input$cluster))
+enrich_list <- list()
+
+message("Starting GO Enrichment for ", length(all_clusters), " clusters...")
+
+# ----- enrichment and visualization ---
+for (clust_id in all_clusters) {
+  current_genes <- cluster_input %>%
+    filter(cluster == clust_id) %>%
+    pull(Gene)
+
+  ego <- enricher(
+    gene         = current_genes,
+    universe     = universe_vector,
+    TERM2GENE    = t2g,
+    TERM2NAME    = t2n,     
+    pvalueCutoff = ptable,
+    qvalueCutoff = qtable,
+    minGSSize    = 2
+  )
+
+  # Check if there are valid results before continuing
+  if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
+    
+    # Force 'BP' ontology so enrichplot doesn't choke on custom/generic objects
+    ego@ontology <- "BP" 
+    
+    # Use Jaccard Coefficient (JC) based on overlap matrix of custom genes
+    ego_sim <- pairwise_termsim(ego, method = "JC", semData = NULL)
+    
+    # Generate treeplot if there are enough terms to cluster (at least 2)
+    if (nrow(as.data.frame(ego)) > 1) {
+      
+      suppressWarnings({
+        p_tree <- treeplot(ego_sim, showCategory = 40) + 
+          labs(
+            title = paste0("Cluster ", clust_id, " GO Tree (Top 40 Terms)"),
+            subtitle = "Terms grouped by semantic similarity based on gene overlap"
+          )
+        
+        # Ensure results directory exists before saving plots
+        if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+        
+        ggsave(
+          filename = file.path(results_dir, paste0("cluster_", clust_id, "_treeplot.png")), 
+          plot = p_tree, 
+          width = 15,    
+          height = 11, 
+          dpi = 300
+        )
+      })
+      
+      # ----- ADDED PRINT STATEMENT ---
+      # Force-renders the treeplot directly inside your RStudio Plots panel / console
+      print(p_tree)
+    }
+    
+    # Save text results to master dataframe list
+    enrich_list[[as.character(clust_id)]] <- as.data.frame(ego) %>%
+      mutate(Analysis_Group = paste0("Cluster_", clust_id))
+      
+  } else {
+    message("No significant GO enrichment found passing thresholds for Cluster ", clust_id)
+  }
+}
+
+# ----- metadata, merge, and output ---
+if (length(enrich_list) > 0) {
+  all_go_res <- bind_rows(enrich_list)
+  unique_go_ids <- unique(all_go_res$ID)
+
+  message("Mapping extra metadata for ", length(unique_go_ids), " unique GO terms...")
+
+  go_metadata_df <- AnnotationDbi::select(
+    x       = GO.db,
+    keys    = unique_go_ids,
+    columns = c("GOID", "TERM", "DEFINITION"),
+    keytype = "GOID"
+  ) %>%
+    dplyr::rename(ID = GOID, GO_Name = TERM, GO_Definition = DEFINITION)
+
+  # Merge metadata with results (keeping columns consistent)
+  final_go_df <- all_go_res %>%
+    dplyr::left_join(go_metadata_df, by = "ID")
+
+  # Standardize gene column naming conventions across variations of clusterProfiler
+  if (!"geneID" %in% colnames(final_go_df) & "gene_id" %in% colnames(final_go_df)) {
+    final_go_df <- final_go_df %>% dplyr::rename(geneID = gene_id)
+  }
+
+  final_go_df <- final_go_df %>%
+    dplyr::select(
+      dplyr::any_of(c(
+        "Analysis_Group", "GO_Name", "ID", "GO_Definition",
+        "Count", "GeneRatio", "BgRatio", "pvalue",
+        "p.adjust", "qvalue", "geneID"
+      ))
+    )
+
+  # Save local CSV
+  if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+  out_path <- file.path(results_dir, "go_anno_cluster_results.csv")
+  write.csv(final_go_df, out_path, row.names = FALSE)
+
+  message("GO Analysis complete. File and plots successfully saved with descriptive text names.")
+  
+  # ----- ADDED PRINT STATEMENT ---
+  # Spits out a clean text preview of the dataframe right to the console
+  cat("\n--- FINAL RESULTS DATAFRAME PREVIEW ---\n")
+  print(tibble::as_tibble(final_go_df), n = 20) # Prints the top 20 rows nicely
+  
+} else {
+  message("Process finished: No significant GO enrichment across any clusters.")
+}
+
+# ----- fix pointers ---
+
+select <- dplyr::select
+filter <- dplyr::filter
+
+message("Namespace reset: 'select' and 'filter' point back to dplyr.")
+```
+
+
+# !!! ELIM
+
+```{r}
+
+# Prepare a clean, named list mapping Genes to GO terms for topGO
+gene_2_go_list <- split(t2g$term_id, t2g$gene_id)
+
+# Identify all available clusters from your fuzzy clustering input
+all_cluster_ids <- sort(unique(df_final_clusters$cluster))
+
+# Custom wrapper to run Elim for a single ontology branch
+run_tiered_ontology <- function(current_cluster, ontology_branch) {
+  # Get genes belonging to the current cluster
+  cluster_genes <- df_final_clusters %>%
+    filter(cluster == current_cluster & is_driver == "High-Confidence") %>%
+#        filter(cluster == current_cluster & membership_score >= clust_thresh) %>%
+    pull(Gene)
+
+  # Create the binary factor vector topGO expects (1 = in cluster, 0 = background)
+  selector_vector <- as.integer(universe_vector %in% cluster_genes)
+  names(selector_vector) <- universe_vector
+  selector_vector <- factor(selector_vector)
+
+  # Initialize the structural topGO data object
+  go_data_obj <- new("topGOdata",
+    ontology = ontology_branch,
+    allGenes = selector_vector,
+    annot = annFUN.gene2GO,
+    gene2GO = gene_2_go_list
+  )
+
+  # Execute the TRUE tiered Elim algorithm
+  elim_result <- runTest(go_data_obj, algorithm = "elim", statistic = "fisher")
+
+  # Extract the top non-redundant terms
+  raw_table <- GenTable(go_data_obj,
+    Elim_p = elim_result,
+    orderBy = "Elim_p",
+    topNodes = 40,
+    numChar = 1000
+  )
+
+  # Format and clean the output metadata
+  raw_table %>%
+    mutate(
+      Analysis_Group = paste0("Cluster_", current_cluster),
+      Ontology = ifelse(ontology_branch == "BP", "Biological Process", "Molecular Function"),
+      # Clean character p-values (e.g., "< 1e-30") to numeric values
+      p.adjust = as.numeric(gsub("< ", "", Elim_p))
+    ) %>%
+    filter(p.adjust <= 0.05) %>% # Keep terms that survived decorrelation
+    dplyr::rename(ID = GO.ID, GO_Name = Term) %>%
+    dplyr::select(Analysis_Group, ID, GO_Name, Ontology, p.adjust, Significant)
+}
+```
+
+
+```{r clustering-of-elim}
+message("Running global structural Elim decorrelation...")
+
+compiled_elim_results <- map_dfr(all_cluster_ids, function(clust) {
+  message("  Processing Cluster ", clust, "...")
+
+  # Safe execution block to gracefully handle empty/flat branches
+  bp_res <- tryCatch(run_tiered_ontology(clust, "BP"), error = function(e) NULL)
+  mf_res <- tryCatch(run_tiered_ontology(clust, "MF"), error = function(e) NULL)
+
+  bind_rows(bp_res, mf_res)
+})
+
+# Quick validation check to confirm cluster presence
+print(table(compiled_elim_results$Analysis_Group))
+```
+
+
+This was originally a few different scripts - combining them broke my variable naming, this fixes it. 
+
+```{r fix-variable-structure}
+
+if ("Ontology" %in% colnames(compiled_elim_results) && !"Ontology_Branch" %in% colnames(compiled_elim_results)) {
+  compiled_elim_results <- compiled_elim_results %>%
+    mutate(Ontology_Branch = case_when(
+      Ontology == "Biological Process" ~ "BP",
+      Ontology == "Molecular Function"  ~ "MF",
+      TRUE ~ Ontology
+    ))
+} else if ("Ontology_Branch" %in% colnames(compiled_elim_results) && !"Ontology" %in% colnames(compiled_elim_results)) {
+  compiled_elim_results <- compiled_elim_results %>%
+    mutate(Ontology = case_when(
+      Ontology_Branch == "BP" ~ "Biological Process",
+      Ontology_Branch == "MF" ~ "Molecular Function",
+      TRUE ~ Ontology_Branch
+    ))
+}
+```
+
+Split the biological processes terms and molecular function terms for plotting
+
+```{r biological-processes-bubbleplots}
+
+# ----- filter and mutate data -----
+bp_base_data <- compiled_elim_results %>%
+  filter(Ontology == "Biological Process") %>%
+  mutate(neg_log_p = -log10(p.adjust))
+
+# theme to share across plots
+shared_theme <- theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    axis.text.y = element_text(face = "bold", size = 8),
+    panel.grid.major = element_line(color = "gray95"),
+    plot.title = element_text(face = "bold", size = 13)
+  )
+
+# ----- plot 1: top 10 terms, ordered by significance ----- 
+bp_standard_data <- bp_base_data %>%
+  group_by(Analysis_Group) %>%
+  slice_max(order_by = neg_log_p, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+plot_standard <- ggplot(bp_standard_data, aes(x = Analysis_Group, y = reorder(GO_Name, neg_log_p))) +
+  geom_point(aes(size = Significant, color = neg_log_p)) +
+  scale_color_gradient(low = "deepskyblue", high = "magenta4", name = "-log10(p)") +
+  shared_theme +
+  labs(
+    title = "GO Biological Process Architecture",
+    subtitle = "Decorrelated Macro-Phenotypes & Temporal Pathways via Elim",
+    x = "Fuzzy Cluster Wave",
+    y = "Decorrelated Biological Process",
+    size = "Gene Count"
+  )
+
+# print and save
+print(plot_standard)
+ggsave(
+  filename = file.path(results_dir, "elim_landscape_biological_process_rescue.png"),
+  plot = plot_standard,
+  width = 9, height = 12, units = "in", dpi = 300
+)
+
+# ----- plot 2: top 8 terms, hierarchically clustered by hclust ----- 
+bp_clust_data <- bp_base_data %>%
+  group_by(Analysis_Group) %>%
+  slice_max(order_by = neg_log_p, n = 8, with_ties = FALSE) %>%
+  ungroup()
+
+# Calculate distance matrices and orders
+wide_matrix_df <- bp_clust_data %>%
+  dplyr::select(GO_Name, Analysis_Group, neg_log_p) %>%
+  distinct() %>%
+  pivot_wider(names_from = Analysis_Group, values_from = neg_log_p, values_fill = 0)
+
+clust_matrix <- as.matrix(wide_matrix_df[, -1])
+rownames(clust_matrix) <- wide_matrix_df$GO_Name
+
+# Cluster rows (GO terms)
+row_dist <- dist(clust_matrix, method = "euclidean")
+row_hc   <- hclust(row_dist, method = "complete")
+go_term_order <- rownames(clust_matrix)[row_hc$order]
+
+# Cluster columns (analysis groups/fuzzy clusters)
+if (ncol(clust_matrix) >= 3) {
+  col_dist <- dist(t(clust_matrix), method = "euclidean")
+  col_hc   <- hclust(col_dist, method = "complete")
+  analysis_group_order <- colnames(clust_matrix)[col_hc$order]
+} else {
+  analysis_group_order <- sort(unique(bp_clust_data$Analysis_Group))
+}
+
+# Apply clustered factors back to data
+bp_plot_clustered_data <- bp_clust_data %>%
+  mutate(
+    GO_Name        = factor(GO_Name, levels = go_term_order),
+    Analysis_Group = factor(Analysis_Group, levels = analysis_group_order)
+  )
+
+plot_clustered <- ggplot(bp_plot_clustered_data, aes(x = Analysis_Group, y = GO_Name)) +
+  geom_point(aes(size = Significant, color = neg_log_p)) +
+  scale_color_gradient(low = "deepskyblue1", high = "magenta4", name = "-log10(p)") +
+  shared_theme +
+  labs(
+    title = "Hierarchically Clustered BP Functional Landscape",
+    subtitle = "Decorrelated Macro-Phenotypes & Temporal Pathways via Elim",
+    x = "Hierarchically Ordered Cluster Waves",
+    y = "Clustered Biological Process Terms",
+    size = "Gene Count"
+  )
+
+# Print and save
+print(plot_clustered)
+ggsave(
+  filename = file.path(results_dir, "elim_landscape_biological_process_rescue_hier_n8.png"),
+  plot = plot_clustered,
+  width = 9, height = 12, units = "in", dpi = 300
+)
+
+message("Both BP plots rendered to console and saved as PNG format.")
+```
+potential colour combinations: steelblue1-purple, deepskyblue-magenta4, gold2-cyan3
+
+
+```{r molecular-function-bubbleplots}
+# ----- filter and mutate -----
+mf_base_data <- compiled_elim_results %>%
+  filter(Ontology == "Molecular Function") %>%
+  mutate(neg_log_p = -log10(p.adjust))
+
+# Common theme to share across plots
+shared_theme <- theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    axis.text.y = element_text(face = "bold", size = 9),
+    panel.grid.major = element_line(color = "gray95"),
+    plot.title = element_text(face = "bold", size = 13)
+  )
+
+# this set of labels gets too long for display
+# trims long labels to 50 characters and append "..."
+truncate_y_labels <- function(x) stringr::str_trunc(x, width = 50, side = "right")
+
+# ----- plot 1: top 10 terms, ordered by significance ----- 
+mf_standard_data <- mf_base_data %>%
+  group_by(Analysis_Group) %>%
+  slice_max(order_by = neg_log_p, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+plot_standard <- ggplot(mf_standard_data, aes(x = Analysis_Group, y = reorder(GO_Name, neg_log_p))) +
+  geom_point(aes(size = Significant, color = neg_log_p)) +
+  scale_color_gradient(low = "deepskyblue", high = "magenta4", name = "-log10(p)") +
+  scale_y_discrete(labels = truncate_y_labels) + # Truncates labels visually
+  shared_theme +
+  labs(
+    title = "GO Molecular Function Architecture",
+    subtitle = "Decorrelated Enzymatic, Binding, & Regulatory Mechanisms via Elim",
+    x = "Fuzzy Cluster Wave",
+    y = "Decorrelated Molecular Function",
+    size = "Gene Count"
+  )
+
+# Print and save
+print(plot_standard)
+ggsave(
+  filename = file.path(results_dir, "elim_landscape_molecular_function_rescue_n10.png"),
+  plot = plot_standard,
+  width = 9, height = 12, units = "in", dpi = 300
+)
+
+# ----- plot 2: top 8 terms, hierarchically clustered by hclust ----- 
+mf_clust_data <- mf_base_data %>%
+  group_by(Analysis_Group) %>%
+  slice_max(order_by = neg_log_p, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+# calculate distance matrices and orders using un-truncated text strings
+wide_matrix_df <- mf_clust_data %>%
+  dplyr::select(GO_Name, Analysis_Group, neg_log_p) %>%
+  distinct() %>%
+  pivot_wider(names_from = Analysis_Group, values_from = neg_log_p, values_fill = 0)
+
+clust_matrix <- as.matrix(wide_matrix_df[, -1])
+rownames(clust_matrix) <- wide_matrix_df$GO_Name
+
+# Cluster rows (GO terms)
+row_dist <- dist(clust_matrix, method = "euclidean")
+row_hc   <- hclust(row_dist, method = "complete")
+go_term_order <- rownames(clust_matrix)[row_hc$order]
+
+# Cluster columns (analysis groups)
+if (ncol(clust_matrix) >= 3) {
+  col_dist <- dist(t(clust_matrix), method = "euclidean")
+  col_hc   <- hclust(col_dist, method = "complete")
+  analysis_group_order <- colnames(clust_matrix)[col_hc$order]
+} else {
+  analysis_group_order <- sort(unique(mf_clust_data$Analysis_Group))
+}
+
+# Apply clustered factors back to data
+mf_plot_clustered_data <- mf_clust_data %>%
+  mutate(
+    GO_Name        = factor(GO_Name, levels = go_term_order),
+    Analysis_Group = factor(Analysis_Group, levels = analysis_group_order)
+  )
+
+plot_clustered <- ggplot(mf_plot_clustered_data, aes(x = Analysis_Group, y = GO_Name)) +
+  geom_point(aes(size = Significant, color = neg_log_p)) +
+  scale_color_gradient(low = "deepskyblue", high = "magenta4", name = "-log10(p)") +
+  scale_y_discrete(labels = truncate_y_labels) + # Truncates labels visually
+  shared_theme +
+  labs(
+    title = "Hierarchically Clustered MF Functional Landscape",
+    subtitle = "Decorrelated Enzymatic, Binding, & Regulatory Mechanisms via Elim",
+    x = "Hierarchically Ordered Cluster Waves",
+    y = "Clustered Molecular Function Terms",
+    size = "Gene Count"
+  )
+
+# Print and save
+print(plot_clustered)
+ggsave(
+  filename = file.path(results_dir, "elim_landscape_molecular_function_rescue_hier_n10.png"),
+  plot = plot_clustered,
+  width = 9, height = 12, units = "in", dpi = 300
+)
+
+message("Both MF plots rendered to console, saved as high-res PNG, and y-axis character limits applied successfully.")
+```
+
+
+
+```{r cluster-elim-visualization}
+# ----- get target clusters ---
+all_analysis_groups <- sort(unique(compiled_elim_results$Analysis_Group))
+
+message("Initiating master visualization loop for ", length(all_analysis_groups), " groups...")
+
+# ----- rollercoaster ---
+for (group_id in all_analysis_groups) {
+  
+  message("------------------------------------------------------------")
+  message("Processing Plots for Group: ", group_id)
+  
+  raw_clust_num <- stringr::str_remove(group_id, "Cluster_")
+  
+  cluster_dir <- file.path(results_dir, group_id)
+  if (!dir.exists(cluster_dir)) dir.create(cluster_dir, recursive = TRUE)
+  
+  cluster_base_data <- compiled_elim_results %>%
+    filter(Analysis_Group == group_id) %>%
+    mutate(neg_log_p = -log10(p.adjust))
+  
+  if (nrow(cluster_base_data) == 0) {
+    message("  Skipping: No enrichment records found for ", group_id)
+    next
+  }
+
+  # ----- significance-weighted word cloud -----
+  tryCatch({
+    word_counts <- cluster_base_data %>%
+      filter(p.adjust <= 0.05) %>%
+      dplyr::select(GO_Name, neg_log_p) %>%
+      unnest_tokens(word, GO_Name) %>%
+      anti_join(stop_words, by = "word") %>%
+      # FIXED SYNTAX: Changed %in= to %in%
+      filter(!word %in% c("activity", "process", "regulation", "positive", "negative", "cellular", "biological") & 
+             !stringr::str_detect(word, "^\\d+$"))
+    
+    if (nrow(word_counts) > 0) {
+      word_cloud_data <- word_counts %>%
+        group_by(word) %>%
+        summarize(weight = max(neg_log_p), count = n()) %>%
+        ungroup() %>%
+        slice_max(order_by = weight, n = 50, with_ties = FALSE)
+      
+      p_wordcloud <- ggplot(word_cloud_data, aes(label = word, size = weight, color = weight)) +
+        geom_text_wordcloud_area(
+          shape = "circle", 
+          eccentricity = 0.7,
+          grid_size = 4,           
+          grid_margin = 1.5,       
+          fontface = "bold",       
+          family = "sans"
+        ) +
+        scale_size_area(max_size = 7) + 
+        scale_color_gradient(low = "deepskyblue", high = "magenta4", name = "-log10(p)") +
+        theme_minimal() +
+        labs(
+          title = paste0(group_id, " Functional Word Cloud"),
+          subtitle = "Visual emphasis scaled by maximum -log10(p-value) [Numbers Removed]"
+        ) +
+        theme(
+          plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+          plot.subtitle = element_text(size = 10, hjust = 0.5)
+        )
+      
+      print(p_wordcloud)
+      ggsave(filename = file.path(cluster_dir, paste0(group_id, "_wordcloud.png")),
+             plot = p_wordcloud, width = 8, height = 6, units = "in", dpi = 300)
+      message("  [✓] Non-overlapping Word Cloud saved.")
+    } else {
+      message("  [-] Word Cloud skipped: No qualifying terms.")
+    }
+  }, error = function(e) { message("  [!] Error building Word Cloud: ", e$message) })
+
+  # ----- structural tree heatmap dendogram -----
+  tryCatch({
+    dendro_subset <- cluster_base_data %>%
+      mutate(Short_Name = stringr::str_trunc(GO_Name, width = 50, side = "right")) %>%
+      slice_max(order_by = neg_log_p, n = 15, with_ties = FALSE)
+    
+    if (nrow(dendro_subset) >= 2) {
+      hc_matrix <- as.matrix(dendro_subset$neg_log_p)
+      rownames(hc_matrix) <- dendro_subset$Short_Name
+      
+      hc_dist <- dist(hc_matrix, method = "euclidean")
+      hc_obj  <- hclust(hc_dist, method = "complete")
+      dendro_data_obj <- dendro_data(hc_obj)
+      
+      dendro_subset$Short_Name <- factor(dendro_subset$Short_Name, levels = hc_obj$labels[hc_obj$order])
+      
+      p_tree <- ggplot(segment(dendro_data_obj)) +
+        geom_segment(aes(x = x, y = y, xend = xend, yend = yend), color = "gray40", width = 0.7) +
+        coord_flip() + scale_y_reverse(expand = c(0.1, 0)) + theme_dendro()
+      
+      p_heatmap <- ggplot(dendro_subset, aes(x = "Significance Profile", y = Short_Name)) +
+        geom_tile(aes(fill = neg_log_p), color = "white", width = 0.9) +
+        geom_text(aes(label = round(neg_log_p, 2)), fontface = "bold", size = 3, color = "black") +
+        scale_fill_gradient(low = "deepskyblue", high = "magenta4", name = "-log10(p)") +
+        scale_y_discrete(position = "right") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(face = "bold", size = 10),
+              axis.text.y = element_text(face = "bold", size = 9),
+              axis.title = element_blank(), panel.grid = element_blank())
+      
+      combined_tree_plot <- p_tree + p_heatmap + 
+        plot_layout(widths = c(1, 2.5)) +
+        plot_annotation(
+          title = paste0(group_id, ": Structural Tree-Heatmap Dendrogram"),
+          subtitle = "Functional modules grouped hierarchically by numerical variance profiles",
+          theme = theme(plot.title = element_text(face = "bold", size = 13))
+        )
+      
+      print(combined_tree_plot)
+      ggsave(filename = file.path(cluster_dir, paste0(group_id, "_hierarchical_tree_heatmap.png")),
+             plot = combined_tree_plot, width = 9, height = 7, units = "in", dpi = 300)
+      message("  [✓] Hierarchical Tree-Heatmap saved.")
+    } else {
+      message("  [-] Tree-Heatmap skipped: Requires at least 2 distinct pathways.")
+    }
+  }, error = function(e) { message("  [!] Error building Tree-Heatmap: ", e$message) })
+
+  # ----- pathway concept network (cnetplot) -----
+
+  tryCatch({
+    net_terms <- cluster_base_data %>%
+      slice_max(order_by = neg_log_p, n = 10, with_ties = FALSE)
+    
+    current_drivers <- cluster_input %>% 
+      filter(cluster == raw_clust_num | cluster == group_id) %>% 
+      pull(Gene)
+    
+    network_edges_raw <- t2g %>%
+      filter(gene_id %in% current_drivers & term_id %in% net_terms$ID) %>%
+      left_join(net_terms, by = c("term_id" = "ID")) %>%
+      mutate(Short_Name = stringr::str_trunc(GO_Name, width = 40, side = "right")) %>%
+      dplyr::select(Short_Name, gene_id, neg_log_p, Significant)
+    
+    if (nrow(network_edges_raw) > 0) {
+      edges <- network_edges_raw %>%
+        dplyr::rename(from = Short_Name, to = gene_id) %>%
+        dplyr::select(from, to) %>% distinct()
+      
+      nodes_pathway <- net_terms %>%
+        mutate(Short_Name = stringr::str_trunc(GO_Name, width = 40, side = "right")) %>%
+        filter(Short_Name %in% edges$from) %>%
+        dplyr::select(Short_Name, neg_log_p, Significant) %>%
+        dplyr::rename(name = Short_Name, size_val = Significant, color_val = neg_log_p) %>%
+        mutate(node_type = "Pathway")
+      
+      nodes_gene <- data.frame(name = unique(edges$to)) %>%
+        mutate(size_val = 1, color_val = NA, node_type = "Gene")
+      
+      nodes <- bind_rows(nodes_pathway, nodes_gene)
+      graph_obj <- tbl_graph(nodes = nodes, edges = edges, directed = FALSE)
+      
+      network_plot <- ggraph(graph_obj, layout = "stress") +
+        geom_edge_link(alpha = 0.15, color = "gray50", width = 0.5) +
+        geom_node_point(aes(size = size_val, color = color_val, shape = node_type)) +
+        scale_shape_manual(values = c("Pathway" = 16, "Gene" = 17)) +
+        scale_color_gradient(low = "deepskyblue", high = "magenta4", na.value = "gold", name = "-log10(p)") +
+        scale_size_continuous(name = "Node Weight", range = c(2.5, 8)) +
+        geom_node_text(aes(label = ifelse(node_type == "Pathway", name, "")), 
+                       repel = TRUE, fontface = "bold", size = 3, bg.color = "white", bg.r = 0.1) +
+        theme_graph(base_family = "sans") +
+        labs(
+          title = paste0(group_id, ": Pathway Concept Network (cnetplot)"),
+          subtitle = "Triangles represent component genes mapped from t2g universe definitions"
+        )
+      
+      print(network_plot)
+      ggsave(filename = file.path(cluster_dir, paste0(group_id, "_pathway_concept_network.png")),
+             plot = network_plot, width = 11, height = 9, units = "in", dpi = 300)
+      message("  [✓] Concept Network Map saved.")
+    } else {
+      message("  [-] Concept Network skipped: No gene-to-term linkages verified.")
+    }
+  }, error = function(e) { message("  [!] Error building Concept Network Map: ", e$message) })
+
+}
+
+
+message("Success! All pictures are pretty and present")
+```
+
+# extended cnetplots
+```{r loop-all-three-cnetplot-variants}
+# ----- define which GO branches to use -----
+all_analysis_groups <- sort(unique(compiled_elim_results$Analysis_Group))
+cnet_variants <- c("BP", "MF", "Combined")
+
+message("Initiating master concept network engine for ", length(all_analysis_groups), " groups...")
+message("Generating 3 distinct structural variants per cluster wave...")
+
+# ----- rollercoaster ----- 
+for (group_id in all_analysis_groups) {
+  
+  raw_clust_num <- stringr::str_remove(group_id, "Cluster_")
+  cluster_dir <- file.path(results_dir, group_id)
+  if (!dir.exists(cluster_dir)) dir.create(cluster_dir, recursive = TRUE)
+  
+  # Pull driving gene inputs for the active wave
+  current_drivers <- cluster_input %>% 
+    filter(cluster == raw_clust_num | cluster == group_id) %>% 
+    pull(Gene)
+  
+  # Inner Loop: BP, MF, and Combined 
+  for (variant in cnet_variants) {
+    
+    tryCatch({
+      # Dynamic subset based on loop target
+      if (variant == "Combined") {
+        subtitle_text <- "Combined Ontology Profile (Biological Process & Molecular Function)"
+        
+        net_terms <- compiled_elim_results %>%
+          filter(Analysis_Group == group_id) %>%
+          mutate(neg_log_p = -log10(p.adjust)) %>%
+          slice_max(order_by = neg_log_p, n = 10, with_ties = FALSE)
+      } else {
+        full_name <- ifelse(variant == "BP", "Biological Process", "Molecular Function")
+        subtitle_text <- paste0("Ontology Profile Focus: ", full_name)
+        
+        net_terms <- compiled_elim_results %>%
+          filter(Analysis_Group == group_id & Ontology_Branch == variant) %>%
+          mutate(neg_log_p = -log10(p.adjust)) %>%
+          slice_max(order_by = neg_log_p, n = 10, with_ties = FALSE)
+      }
+      
+      # Safety: Skip if data slice contains no records
+      if (nrow(net_terms) == 0) {
+        message("  [-] Group ", group_id, " (", variant, ") skipped: No records met thresholds.")
+        next
+      }
+      
+      # Extract linkages from global annotation universe (t2g)
+      network_edges_raw <- t2g %>%
+        filter(gene_id %in% current_drivers & term_id %in% net_terms$ID) %>%
+        left_join(net_terms, by = c("term_id" = "ID")) %>%
+        mutate(Short_Name = stringr::str_trunc(GO_Name, width = 40, side = "right")) %>%
+        dplyr::select(Short_Name, gene_id, neg_log_p, Significant)
+      
+      if (nrow(network_edges_raw) > 0) {
+        
+        # Isolate clean edge coordinate tables
+        edges <- network_edges_raw %>%
+          dplyr::rename(from = Short_Name, to = gene_id) %>%
+          dplyr::select(from, to) %>% 
+          distinct()
+        
+        # Build node metadata sets
+        nodes_pathway <- net_terms %>%
+          mutate(Short_Name = stringr::str_trunc(GO_Name, width = 40, side = "right")) %>%
+          filter(Short_Name %in% edges$from) %>%
+          dplyr::select(Short_Name, neg_log_p, Significant) %>%
+          dplyr::rename(name = Short_Name, size_val = Significant, color_val = neg_log_p) %>%
+          mutate(node_type = "Pathway")
+        
+        nodes_gene <- data.frame(name = unique(edges$to)) %>%
+          mutate(size_val = 1, color_val = NA, node_type = "Gene")
+        
+        # Construct structural tidy graph network
+        nodes <- bind_rows(nodes_pathway, nodes_gene)
+        graph_obj <- tbl_graph(nodes = nodes, edges = edges, directed = FALSE)
+        
+        # figure
+        network_plot <- ggraph(graph_obj, layout = "stress") +
+          geom_edge_link(alpha = 0.15, color = "gray50", width = 0.5) +
+          geom_node_point(aes(size = size_val, color = color_val, shape = node_type)) +
+          scale_shape_manual(values = c("Pathway" = 16, "Gene" = 17)) +
+          scale_color_gradient(low = "deepskyblue", high = "magenta4", na.value = "gold", name = "-log10(p)") +
+          scale_size_continuous(name = "Node Weight", range = c(2.5, 8)) +
+          geom_node_text(aes(label = ifelse(node_type == "Pathway", name, "")), 
+                         repel = TRUE, fontface = "bold", size = 3, bg.color = "white", bg.r = 0.1) +
+          theme_graph(base_family = "sans") +
+          labs(
+            title = paste0(group_id, ": Pathway Concept Network (cnetplot)"),
+            subtitle = paste0(subtitle_text, " | Triangles map component gene positions")
+          )
+        print(network_plot)
+        # dynamic save
+        file_export_name <- file.path(cluster_dir, paste0(group_id, "_", variant, "_cnetplot.png"))
+        
+        ggsave(filename = file_export_name, plot = network_plot, width = 11, height = 9, units = "in", dpi = 300)
+        message("  [✓] Saved: ", group_id, " [", variant, " Version]")
+        
+      } else {
+        message("  [-] Linkage skip: ", group_id, " (", variant, ") has no verified gene-to-term edges.")
+      }
+      
+    }, error = function(e) { 
+      message("  [!] Error processing variant ", variant, " for ", group_id, ": ", e$message) 
+    })
+  }
+}
+
+
+message("Success! All pictures are pretty and present.")
+```
+
+
+
+# sub category elim plots
+
+```{r}
+# Ensure the subcategory directory is ready
+sub_plots_dir <- file.path(results_dir, "targeted_subcategories")
+if (!dir.exists(sub_plots_dir)) dir.create(sub_plots_dir, recursive = TRUE)
+
+# Prepare universal high-resolution metric baseline
+raw_high_res_df <- compiled_elim_results %>%
+  mutate(
+    neg_log_p = -log10(p.adjust),
+    Wrapped_GO_Name = str_wrap(as.character(GO_Name), width = 40)
+  )
+
+# ----- define functions -----
+plot_targeted_subcategory <- function(subset_df, plot_title, filename, color_palette = "mako") {
+  if (nrow(subset_df) == 0) {
+    message(paste("Skipping", plot_title, "- No enriched terms matched this keyword filter."))
+    return(NULL)
+  }
+
+  # Guarantee structural grid integrity across all unique clusters in your data
+  complete_grid <- expand_grid(
+    Analysis_Group = unique(raw_high_res_df$Analysis_Group),
+    Wrapped_GO_Name = unique(subset_df$Wrapped_GO_Name)
+  ) %>%
+    left_join(subset_df, by = c("Analysis_Group", "Wrapped_GO_Name")) %>%
+    mutate(neg_log_p = replace_na(neg_log_p, 0))
+
+  sub_heatmap <- ggplot(complete_grid, aes(x = Analysis_Group, y = reorder(Wrapped_GO_Name, neg_log_p))) +
+    geom_tile(aes(fill = neg_log_p), color = "white", lwd = 0.4) +
+    scale_fill_viridis_c(option = color_palette, direction = -1, name = "-log10(p)") +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+      axis.text.y = element_text(size = 9, lineheight = 0.85, face = "bold"),
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "bold", size = 12)
+    ) +
+    labs(
+      title = plot_title,
+      subtitle = "High-Resolution Elim Term Sub-Slices Across Waves",
+      x = "Cluster Wave", y = NULL
+    )
+
+  # Save clean layout vectors
+  ggsave(file.path(sub_plots_dir, paste0(filename, ".pdf")),
+    plot = sub_heatmap, width = 7.5, height = max(3, nrow(subset_df) * 0.35 + 2), units = "in"
+  )
+
+  return(sub_heatmap)
+}
+
+# aa subcategory extractions 
+message("Extracting targeted Amino Acid subcategories...")
+
+# ----- A. Branched-Chain Amino Acids (BCAA) ---
+bcaa_terms <- raw_high_res_df %>%
+  filter(str_detect(GO_Name, "(?i)isoleucine|leucine|valine|branched-chain"))
+
+plot_targeted_subcategory(bcaa_terms, "Branched-Chain Amino Acid (BCAA) Tracks", "sub_bp_bcaa", "mako")
+
+
+# ----- B. Aromatic Amino Acids ---
+aromatic_terms <- raw_high_res_df %>%
+  filter(str_detect(GO_Name, "(?i)tryptophan|tyrosine|phenylalanine|aromatic amino acid"))
+
+plot_targeted_subcategory(aromatic_terms, "Aromatic Amino Acid Modules", "sub_bp_aromatic_aa", "mako")
+
+
+# ----- C. Sulfur-Containing & Nitrogen-Core Amino Acids ---
+# Catches primary regulatory vectors like Glutamine/Glutamate and Methionine/Cysteine
+nitrogen_sulfur_aa_terms <- raw_high_res_df %>%
+  filter(str_detect(GO_Name, "(?i)glutamine|glutamate|arginine|methionine|cysteine|sulfur amino acid"))
+
+plot_targeted_subcategory(nitrogen_sulfur_aa_terms, "Core Nitrogen & Sulfur Amino Acids", "sub_bp_nitrogen_sulfur_aa", "mako")
+
+# ----- cyclic and aromatic amino acids 
+message("Extracting targeted Cyclic & Aromatic Amino Acid subcategories...")
+
+# captures specific cyclic branches and their core upstream precursor architecture (shikimate)
+cyclic_aromatic_terms <- raw_high_res_df %>%
+  filter(str_detect(GO_Name, "(?i)phenylalanine|tyrosine|tryptophan|histidine|aromatic amino acid|shikimate|chorismate"))
+
+# make plot
+plot_targeted_subcategory(
+  subset_df = cyclic_aromatic_terms,
+  plot_title = "Cyclic & Aromatic Amino Acid Architecture",
+  filename = "sub_bp_cyclic_aromatic_aa",
+  color_palette = "mako"
+)
+
+
+# ----- lipids and fatty acids ---
+message("Extracting targeted Lipid & Fatty Acid subcategories...")
+
+# ----- A. Fatty Acid Metabolism & Beta-Oxidation ---
+# Separates raw structural breakdown chains and oxidation processing pathways
+fatty_acid_oxidation_terms <- raw_high_res_df %>%
+  filter(str_detect(GO_Name, "(?i)fatty acid|beta-oxidation|acyl-coa|ketone body"))
+
+plot_targeted_subcategory(fatty_acid_oxidation_terms, "Fatty Acid Metabolism & Beta-Oxidation", "sub_lipid_fatty_acid_oxidation", "rocket")
+
+
+# ----- B. Membrane Lipids & Phospholipids ---
+# Isolates structural building modifications (e.g., cell wall envelope integrity)
+membrane_lipid_terms <- raw_high_res_df %>%
+  filter(str_detect(GO_Name, "(?i)phospholipid|glycerolipid|sphingolipid|lipid bilayer|cardiolipin"))
+
+plot_targeted_subcategory(membrane_lipid_terms, "Membrane & Phospholipid Remodeling", "sub_lipid_membrane_structures", "rocket")
+
+message("Targeted subcategory pipeline executed successfully. Check the 'targeted_subcategories' directory.")
+```
+
+
+
+```{r aa-branch-cyclic}
+# Ensure output directory paths are ready
+sub_plots_dir <- file.path(results_dir, "targeted_subcategories")
+if (!dir.exists(sub_plots_dir)) dir.create(sub_plots_dir, recursive = TRUE)
+
+
+message("Generating Figure 1 (BCAA + Cyclic/Aromatic)...")
+
+fig1_data <- raw_high_res_df %>%
+  mutate(
+    Facet_Group = case_when(
+      str_detect(GO_Name, "(?i)isoleucine|leucine|valine|branched-chain") ~ "Branched-Chain (BCAA)",
+      str_detect(GO_Name, "(?i)phenylalanine|tyrosine|tryptophan|histidine|aromatic|shikimate|chorismate") ~ "Cyclic & Aromatic",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Facet_Group))
+
+# Matrix tracking cross-grid integrity
+grid_fig1 <- expand_grid(
+  Analysis_Group = unique(raw_high_res_df$Analysis_Group),
+  Wrapped_GO_Name = unique(fig1_data$Wrapped_GO_Name)
+) %>%
+  left_join(distinct(fig1_data, Wrapped_GO_Name, Facet_Group), by = "Wrapped_GO_Name") %>%
+  left_join(fig1_data, by = c("Analysis_Group", "Wrapped_GO_Name", "Facet_Group")) %>%
+  mutate(
+    neg_log_p = replace_na(neg_log_p, 0),
+    Wrapped_Facet = str_wrap(Facet_Group, width = 15)
+  )
+
+h1 <- max(4, (length(unique(grid_fig1$Wrapped_GO_Name)) * 0.3) + 2)
+
+plot_fig1 <- ggplot(grid_fig1, aes(x = Analysis_Group, y = reorder(Wrapped_GO_Name, neg_log_p))) +
+  geom_tile(aes(fill = neg_log_p), color = "white", lwd = 0.4) +
+  scale_fill_viridis_c(option = "mako", direction = -1, name = "-log10(p)") +
+  facet_grid(Wrapped_Facet ~ ., scales = "free_y", space = "free_y") +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    axis.text.y = element_text(size = 8.5, lineheight = 0.85, face = "bold"),
+    panel.grid = element_blank(),
+    strip.text.y = element_text(angle = 90, face = "bold", size = 9.5, lineheight = 0.9, vjust = 0.5),
+    strip.background = element_rect(fill = "gray95", color = "gray85", linewidth = 0.5),
+    plot.title = element_text(face = "bold", size = 12)
+  ) +
+  labs(title = "Figure 1: Regulatory Amino Acid Infrastructure", x = "Cluster Wave", y = NULL)
+
+print(plot_fig1)
+
+ggsave(file.path(sub_plots_dir, "figure_1_bcaa_and_cyclic.pdf"), plot = plot_fig1, width = 9, height = h1, units = "in")
+```
+
+```{r}
+# ----- fig 3 v
+message("Generating Figure 3 (Figure 1 + Other Amino Acids with General Structural Terms)...")
+
+fig3_data <- raw_high_res_df %>%
+  # UPDATED FILTER: Added general structural catchphrases to the root query
+  filter(str_detect(GO_Name, "(?i)amino acid|peptide|aminotransferase|isoleucine|leucine|valine|branched-chain|branched chain|phenylalanine|tyrosine|tryptophan|histidine|shikimate|chorismate|cyclic|aromatic")) %>%
+  
+  # Filter out explicit Nitrogen and Sulfur terms to keep this subset mathematically unmixed
+  filter(!ID %in% fig2_data$ID) %>%
+  
+  mutate(
+    Facet_Group = case_when(
+      # UPDATED CONDITION: Catches both hyphenated and unhyphenated variant terms
+      str_detect(GO_Name, "(?i)isoleucine|leucine|valine|branched-chain|branched chain") ~ "Branched-Chain (BCAA)",
+      
+      # UPDATED CONDITION: Added specific explicit catches for general structural terms
+      str_detect(GO_Name, "(?i)phenylalanine|tyrosine|tryptophan|histidine|aromatic|cyclic|shikimate|chorismate") ~ "Cyclic & Aromatic",
+
+      # NEW HIGH-RESOLUTION SPLITS TO ELIMINATE HOUSEKEEPING BLOCKS:
+      str_detect(GO_Name, "(?i)polyamine|putrescine|spermidine|cadaverine") ~ "Polyamines & Stress Diamines",
+      str_detect(GO_Name, "(?i)aspartate|asparagine|lysine|diaminopimelate") ~ "Aspartate-Family Super-Cluster",
+      str_detect(GO_Name, "(?i)glycine|serine|threonine|alanine|pyruvate-derived") ~ "Small Aliphatics (Precursors)",
+      str_detect(GO_Name, "(?i)proline|ectoine|osmoprotect|osmotic") ~ "Osmoprotection & Proline",
+      TRUE ~ "General Peptide & AA Transport"
+    )
+  )
+
+grid_fig3 <- expand_grid(
+  Analysis_Group = unique(raw_high_res_df$Analysis_Group),
+  Wrapped_GO_Name = unique(fig3_data$Wrapped_GO_Name)
+) %>%
+  left_join(distinct(fig3_data, Wrapped_GO_Name, Facet_Group), by = "Wrapped_GO_Name") %>%
+  left_join(fig3_data, by = c("Analysis_Group", "Wrapped_GO_Name", "Facet_Group")) %>%
+  mutate(
+    neg_log_p = replace_na(neg_log_p, 0),
+    Wrapped_Facet = str_wrap(Facet_Group, width = 15)
+  )
+
+h3 <- max(4.5, (length(unique(grid_fig3$Wrapped_GO_Name)) * 0.3) + 2)
+
+plot_fig3 <- ggplot(grid_fig3, aes(x = Analysis_Group, y = reorder(Wrapped_GO_Name, neg_log_p))) +
+  geom_tile(aes(fill = neg_log_p), color = "white", lwd = 0.4) +
+  scale_fill_viridis_c(option = "mako", direction = -1, name = "-log10(p)") +
+  facet_grid(Wrapped_Facet ~ ., scales = "free_y", space = "free_y") +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    axis.text.y = element_text(size = 8.5, lineheight = 0.85, face = "bold"),
+    panel.grid = element_blank(),
+    strip.text.y = element_text(angle = 90, face = "bold", size = 9.5, lineheight = 0.9, vjust = 0.5),
+    strip.background = element_rect(fill = "gray95", color = "gray85", linewidth = 0.5),
+    plot.title = element_text(face = "bold", size = 12)
+  ) +
+  labs(title = "Figure 3: Comprehensive Profile & Structural Modulators", x = "Cluster Wave", y = NULL)
+
+print(plot_fig3)
+
+ggsave(file.path(sub_plots_dir, "figure_3_expanded_amino_landscape.png"), plot = plot_fig3, width = 9.5, height = h3, units = "in")
+
+message("All three distinct figures have been processed and saved successfully.")
+```
+
+```{r clustered-axes-aa}
+
+
+# Ensure results directory exists
+if (!dir.exists(sub_plots_dir)) dir.create(sub_plots_dir, recursive = TRUE)
+
+message("Executing complete Figure 3 Pipeline: Expanded Landscape with Bi-Clustered Axes (Mako Palette)...")
+
+# ----- extract and facet data ----- 
+fig3_data <- raw_high_res_df %>%
+  # Expanded query to include generic branched chain, cyclic, and aromatic terms
+  filter(str_detect(GO_Name, "(?i)amino acid|peptide|aminotransferase|isoleucine|leucine|valine|branched-chain|branched chain|phenylalanine|tyrosine|tryptophan|histidine|shikimate|chorismate|cyclic|aromatic")) %>%
+  
+  # Keep this pool mathematically isolated from the explicit Nitrogen/Sulfur subsets
+  filter(!ID %in% fig2_data$ID) %>%
+  
+  mutate(
+    Facet_Group = case_when(
+      str_detect(GO_Name, "(?i)isoleucine|leucine|valine|branched-chain|branched chain") ~ "Branched-Chain (BCAA)",
+      str_detect(GO_Name, "(?i)phenylalanine|tyrosine|tryptophan|histidine|aromatic|cyclic|shikimate|chorismate") ~ "Cyclic & Aromatic",
+      str_detect(GO_Name, "(?i)polyamine|putrescine|spermidine|cadaverine") ~ "Polyamines & Stress Diamines",
+      str_detect(GO_Name, "(?i)aspartate|asparagine|lysine|diaminopimelate") ~ "Aspartate-Family Super-Cluster",
+      str_detect(GO_Name, "(?i)glycine|serine|threonine|alanine|pyruvate-derived") ~ "Small Aliphatics (Precursors)",
+      str_detect(GO_Name, "(?i)proline|ectoine|osmoprotect|osmotic") ~ "Osmoprotection & Proline",
+      TRUE ~ "General Peptide & AA Transport"
+    )
+  )
+
+# Build comprehensive observation matrix network 
+grid_fig3 <- expand_grid(
+  Analysis_Group = unique(raw_high_res_df$Analysis_Group),
+  Wrapped_GO_Name = unique(fig3_data$Wrapped_GO_Name)
+) %>%
+  left_join(distinct(fig3_data, Wrapped_GO_Name, Facet_Group), by = "Wrapped_GO_Name") %>%
+  left_join(fig3_data, by = c("Analysis_Group", "Wrapped_GO_Name", "Facet_Group")) %>%
+  mutate(neg_log_p = replace_na(neg_log_p, 0))
+
+# scale output height based on final row counts
+h3 <- max(4.5, (length(unique(grid_fig3$Wrapped_GO_Name)) * 0.28) + 2)
+
+# pivot to wide format
+matrix_data <- grid_fig3 %>%
+  dplyr::select(Wrapped_GO_Name, Analysis_Group, neg_log_p) %>%
+  distinct() %>%
+  pivot_wider(names_from = Analysis_Group, values_from = neg_log_p, values_fill = 0) %>%
+  as.data.frame()
+
+# Relocate row labels to formal row identifier metadata slots
+rownames(matrix_data) <- matrix_data$Wrapped_GO_Name
+matrix_data$Wrapped_GO_Name <- NULL
+heatmap_matrix <- as.matrix(matrix_data)
+
+# ----- colour faceting ---
+row_metadata <- data.frame(Wrapped_GO_Name = rownames(heatmap_matrix)) %>%
+  left_join(distinct(grid_fig3, Wrapped_GO_Name, Facet_Group), by = "Wrapped_GO_Name")
+
+row_anno <- rowAnnotation(
+  `Structural Group` = row_metadata$Facet_Group,
+  col = list(`Structural Group` = c(
+    "Branched-Chain (BCAA)"          = "darkred",
+    "Cyclic & Aromatic"              = "darkblue",
+    "General Peptide & AA Transport" = "grey"
+  )),
+  show_annotation_name = FALSE
+)
+
+# ----- define mako so it looks like our other figures
+max_val <- max(heatmap_matrix, na.rm = TRUE)
+if(max_val == 0) max_val <- 1 
+
+color_fun <- colorRamp2(
+  seq(0, max_val, length.out = 5), 
+  rev(viridis::mako(5, direction = 1))
+)
+
+# ----- hierarchical heatmap, baby! ---
+clustered_heatmap <- Heatmap(
+  heatmap_matrix,
+  name = "-log10(p)",
+  col = color_fun,
+  
+  # cluster your axes
+  cluster_rows = TRUE,          
+  cluster_columns = TRUE,       
+  clustering_distance_rows = "euclidean",
+  clustering_method_rows = "complete",
+  clustering_distance_columns = "euclidean",
+  clustering_method_columns = "complete",
+  
+  # layout
+  row_names_gp = gpar(fontface = "bold", fontsize = 8.5),
+  column_names_gp = gpar(fontface = "bold", fontsize = 10, rotation = 45),
+  rect_gp = gpar(col = "white", lwd = 0.4), 
+  
+  # structural groups as a left color block
+  left_annotation = row_anno,
+  
+  column_title = "Figure 3: Bi-Clustered Structural Profile Matrix (Mako Palette)",
+  column_title_gp = gpar(fontface = "bold", fontsize = 12)
+)
+
+# Save 
+png(
+  filename = file.path(sub_plots_dir, "figure_3_bi_clustered_mako_landscape.png"),
+  width = 11, height = h3, units = "in", res = 300
+)
+draw(clustered_heatmap)
+dev.off()
+
+# Render to active IDE/Markdown notebook panel
+print(clustered_heatmap)
+
+message("Figure 3 fully generated and saved successfully.")
+```
+
+
+
+```{r}
+# Ensure subfolder exists
+lipid_plots_dir <- file.path(results_dir, "targeted_subcategories")
+if (!dir.exists(lipid_plots_dir)) dir.create(lipid_plots_dir, recursive = TRUE)
+
+# Prepare base dataset metrics
+raw_lipid_df <- compiled_elim_results %>%
+  mutate(
+    neg_log_p = -log10(p.adjust),
+    Wrapped_GO_Name = str_wrap(as.character(GO_Name), width = 40)
+  )
+
+# ----- membrane synthesis and adaptation ----- 
+message("Compiling Figure 4: Bacterial Membrane Core Synthesis...")
+
+fig4_data <- raw_lipid_df %>%
+  mutate(
+    Facet_Group = case_when(
+      str_detect(GO_Name, "(?i)unsaturated|cyclopropane|desaturase|fluidity") ~ "Membrane Fluidity & Stress Adaptation",
+      str_detect(GO_Name, "(?i)phosphatidyl|cardiolipin|glycerolipid|phospholipid biosyn") ~ "Phospholipid Head Groups (Charge Control)",
+      str_detect(GO_Name, "(?i)fatty acid biosyn|acyl-carrier|[^catabolic] biosynthetic") ~ "FAS II Core Elongation",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Facet_Group))
+
+grid_fig4 <- expand_grid(
+  Analysis_Group = unique(raw_lipid_df$Analysis_Group),
+  Wrapped_GO_Name = unique(fig4_data$Wrapped_GO_Name)
+) %>%
+  left_join(distinct(fig4_data, Wrapped_GO_Name, Facet_Group), by = "Wrapped_GO_Name") %>%
+  left_join(fig4_data, by = c("Analysis_Group", "Wrapped_GO_Name", "Facet_Group")) %>%
+  mutate(
+    neg_log_p = replace_na(neg_log_p, 0),
+    Wrapped_Facet = str_wrap(Facet_Group, width = 15)
+  )
+
+h4 <- max(4, (length(unique(grid_fig4$Wrapped_GO_Name)) * 0.3) + 2)
+
+plot_fig4 <- ggplot(grid_fig4, aes(x = Analysis_Group, y = reorder(Wrapped_GO_Name, neg_log_p))) +
+  geom_tile(aes(fill = neg_log_p), color = "white", lwd = 0.4) +
+  scale_fill_viridis_c(option = "rocket", direction = -1, name = "-log10(p)") +
+  facet_grid(Wrapped_Facet ~ ., scales = "free_y", space = "free_y") +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    axis.text.y = element_text(size = 8.5, lineheight = 0.85, face = "bold"),
+    panel.grid = element_blank(),
+    strip.text.y = element_text(angle = 90, face = "bold", size = 9.5, lineheight = 0.9, vjust = 0.5),
+    strip.background = element_rect(fill = "gray95", color = "gray85", linewidth = 0.5),
+    plot.title = element_text(face = "bold", size = 12)
+  ) +
+  labs(title = "Figure 4: Bacterial Membrane Biogenesis & Fluidity Control", x = "Cluster Wave", y = NULL)
+
+ggsave(file.path(lipid_plots_dir, "figure_4_bacterial_membrane_core.pdf"), plot = plot_fig4, width = 9.5, height = h4, units = "in")
+print(plot_fig4)
+
+# ----- lipid catabolism and envelope ----- 
+message("Compiling Figure 5: Lipid Degradation & Outer Envelope Components...")
+
+fig5_data <- raw_lipid_df %>%
+  mutate(
+    Facet_Group = case_when(
+      str_detect(GO_Name, "(?i)beta-oxidation|fatty acid catabolic|acyl-coa dehydro") ~ "Beta-Oxidation (Carbon Sourcing)",
+      str_detect(GO_Name, "(?i)lipid A|lipopolysaccharide|teichoic|outer membrane lipid") ~ "Envelope Armor (LPS / Anchors)",
+      str_detect(GO_Name, "(?i)lipid transport|lipid translocation|flippase|msbA") ~ "Lipid Translocation & Export",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Filter for general lipid terms that weren't captured by Figure 4 or the explicit filters above
+  bind_rows(
+    raw_lipid_df %>%
+      filter(str_detect(GO_Name, "(?i)lipid|fatty acid")) %>%
+      filter(!ID %in% fig4_data$ID) %>%
+      mutate(Facet_Group = "General Lipid Housekeeping")
+  ) %>%
+  # Filter down to eliminate missing data duplicates
+  filter(!is.na(Facet_Group)) %>%
+  distinct(Analysis_Group, ID, .keep_all = TRUE)
+
+grid_fig5 <- expand_grid(
+  Analysis_Group = unique(raw_lipid_df$Analysis_Group),
+  Wrapped_GO_Name = unique(fig5_data$Wrapped_GO_Name)
+) %>%
+  left_join(distinct(fig5_data, Wrapped_GO_Name, Facet_Group), by = "Wrapped_GO_Name") %>%
+  left_join(fig5_data, by = c("Analysis_Group", "Wrapped_GO_Name", "Facet_Group")) %>%
+  mutate(
+    neg_log_p = replace_na(neg_log_p, 0),
+    Wrapped_Facet = str_wrap(Facet_Group, width = 15)
+  )
+
+h5 <- max(4, (length(unique(grid_fig5$Wrapped_GO_Name)) * 0.3) + 2)
+
+plot_fig5 <- ggplot(grid_fig5, aes(x = Analysis_Group, y = reorder(Wrapped_GO_Name, neg_log_p))) +
+  geom_tile(aes(fill = neg_log_p), color = "white", lwd = 0.4) +
+  scale_fill_viridis_c(option = "mako", direction = -1, name = "-log10(p)") +
+  facet_grid(Wrapped_Facet ~ ., scales = "free_y", space = "free_y") +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    axis.text.y = element_text(size = 8.5, lineheight = 0.85, face = "bold"),
+    panel.grid = element_blank(),
+    strip.text.y = element_text(angle = 90, face = "bold", size = 9.5, lineheight = 0.9, vjust = 0.5),
+    strip.background = element_rect(fill = "gray95", color = "gray85", linewidth = 0.5),
+    plot.title = element_text(face = "bold", size = 12)
+  ) +
+  labs(title = "Figure 5: Lipid Catabolism & Outer Envelope Architecture", x = "Cluster Wave", y = NULL)
+
+print(plot_fig5)
+
+ggsave(file.path(lipid_plots_dir, "figure_5_lipid_catabolism_and_armor.pdf"), plot = plot_fig5, width = 9.5, height = h5, units = "in")
+
+message("Lipid subcategory pipeline executed. Figures 4 and 5 saved.")
+```
+

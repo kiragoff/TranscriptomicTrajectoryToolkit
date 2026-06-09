@@ -1,0 +1,10 @@
+.Rproj.user
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+# ignore raw data and script outputs
+kallisto/
+results/
+meta.csv
+peri-anno-definitions.tsv
