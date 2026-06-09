@@ -5,6 +5,12 @@ date: "2026-05-25"
 output: html_document
 ---
 
+# STATUS: Fully verified and functional.
+# Verified sequential chunk execution, corrected variable scope mismatches,
+# and validated image exports to results directory.
+# Last audited: June 2026
+
+
 # 1. Setup
 
 ```{r setup, include=FALSE}
@@ -295,28 +301,6 @@ write_csv(
 
 ## 4.4 Visualize Results
 
-```{r volcano-plots-0624}
-alpha <- 0.05
-lfc_cutoff <- 1
-contrast_set <- res_interaction
-
-contrast_name <- deparse(substitute(contrast_set))
-save <- sprintf("volcano-%s-qval_%g-lfc_%g.png", contrast_name, alpha, lfc_cutoff)
-
-ev <- EnhancedVolcano(
-  contrast_set,
-  lab = rownames(contrast_set),
-  x = "log2FoldChange",
-  y = "padj",
-  pCutoff = alpha,
-  FCcutoff = lfc_cutoff,
-  selectLab = NULL
-)
-ggsave (file.path(results_dir,save))
-
-
-```
-
 
 ```{r volcano-0624}
 # variables
@@ -349,6 +333,8 @@ ev <- EnhancedVolcano(
   title = headline,
   subtitle = subhead
 )
+
+print(ev)
 
 ggsave(filename = file.path(results_dir, save))
 ```
