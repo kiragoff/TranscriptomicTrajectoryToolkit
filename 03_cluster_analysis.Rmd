@@ -1,0 +1,2628 @@
+---
+title: "2 - cluster analysis and over representation"
+author: "Kira Goff"
+date: "2026-05-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(DESeq2)
+library(ggplot2)
+```
+
+use the contrasts to create a three dimensional vector
+
+```{r}
+df <- tibble(
+  gene = rownames(res_time),
+
+  time_effect        = res_time$log2FoldChange,
+  exposure_effect    = res_exposure$log2FoldChange,
+  interaction_effect = res_interaction$log2FoldChange
+)
+
+```
+
+Model space for clustering
+```{r}
+
+mat <- df %>%
+  select(time_effect, exposure_effect, interaction_effect) %>%
+  as.matrix()
+
+rownames(mat) <- df$gene
+mat_scaled <- scale(mat)
+```
+
+OR: at 24h
+
+```{r}
+df24 <- df %>%
+  mutate(
+    exposure_06h = exposure_effect,
+    exposure_24h = exposure_effect + interaction_effect
+  )
+mat24 <- df24 %>%
+  select(time_effect, exposure_06h, exposure_24h) %>%
+  as.matrix()
+
+rownames(mat24) <- df24$gene
+mat_scaled_24 <- scale(mat24)
+```
+
+```{r}
+ggplot(df24, aes(exposure_06h, exposure_24h)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, linetype = "dashed") +
+  theme_minimal() +
+  labs(
+    x = "Exposure effect (06h)",
+    y = "Exposure effect (24h)",
+    title = "Time modulation of exposure response"
+  )
+```
+
+```{r}
+ggplot(df24, aes(exposure_06h, exposure_24h)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, linetype = "dashed") +
+  theme_minimal() +
+  labs(
+    x = "Exposure effect (06h)",
+    y = "Exposure effect (24h)",
+    title = "Time modulation of exposure response"
+  )
+```
+
+
+```{r}
+mat <- mat_scaled_24
+
+# convert to matrix (safe)
+mat <- as.matrix(mat)
+
+# remove non-finite rows
+keep <- apply(mat, 1, function(x) all(is.finite(x)))
+
+mat_clean <- mat[keep, ]
+
+mat_scaled_24_clean <- scale(mat_clean)
+
+library(cluster)
+
+sil_width <- numeric(10)
+
+for (k in 2:10) {
+  km <- kmeans(mat_scaled_24_clean, centers = k, nstart = 25)
+
+  ss <- silhouette(km$cluster, dist(mat_scaled_24_clean))
+
+  sil_width[k] <- mean(ss[, 3])
+}
+
+plot(2:10, sil_width[2:10], type = "b")
+```
+
+```{r}
+
+library(cluster)
+
+sil_width <- c()
+
+for (k in 2:10) {
+  km <- kmeans(mat_scaled_24_clean, centers = k, nstart = 25)
+  ss <- silhouette(km$cluster, dist(mat_scaled_24_clean))
+  sil_width[k] <- mean(ss[, 3])
+}
+
+plot(2:10, sil_width[2:10], type = "b")
+```
+
+```{r}
+results <- list()
+
+for (k in 2:10) {
+
+  model <- cmeans(mat_scaled_24_clean, centers = k, m = 1.25)
+
+  cluster <- max.col(model$membership)
+
+  sil <- silhouette(cluster, dist(mat_scaled_24_clean))
+
+  results[[k]] <- list(
+    silhouette = mean(sil[, 3]),
+    entropy = mean(-rowSums(model$membership * log(model$membership)))
+  )
+}
+```
+
+```{r}
+sil_vals <- sapply(results, `[[`, "silhouette")
+ent_vals <- sapply(results, `[[`, "entropy")
+
+plot(2:10, sil_vals[2:10], type="b", col="blue",
+     ylab="Score", xlab="k")
+lines(2:10, ent_vals[2:10], col="red")
+legend("bottomright", c("silhouette", "entropy"),
+       col=c("blue", "red"), lty=1)
+```
+
+# using log2fc at 06 and 24 as our space, instead of the vectors
+
+
+```{r}
+df_exp <- tibble(
+  gene = rownames(res_06h_exposure),
+
+  log2FC_06h = res_06h_exposure$log2FoldChange,
+  log2FC_24h = res_24h_exposure$log2FoldChange
+)
+```
+
+```{r}
+ggplot(df_exp, aes(log2FC_06h, log2FC_24h)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, linetype = "dashed") +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0) +
+  theme_minimal() +
+  labs(
+    x = "Exposure effect (06h)",
+    y = "Exposure effect (24h)",
+    title = "Exposure response modulation over time"
+  )
+```
+
+```{r}
+library(e1071)
+
+mat_exp <- df_exp %>%
+  select(log2FC_06h, log2FC_24h) %>%
+  as.matrix()
+
+rownames(mat_exp) <- df_exp$gene
+
+mat_exp <- scale(mat_exp)
+```
+
+```{r}
+library(e1071)
+library(cluster)
+
+k_vals <- 2:10
+
+sil_vals <- numeric(length(k_vals))
+fuzz_vals <- numeric(length(k_vals))  # fuzziness / entropy
+```
+
+```{r}
+for (i in seq_along(k_vals)) {
+
+  k <- k_vals[i]
+
+  model <- cmeans(mat_scaled_24_clean, centers = k, m = 1.25)
+
+  # hard assignment (for silhouette)
+  cl <- model$cluster
+
+  ss <- silhouette(cl, dist(mat_scaled_24_clean))
+  sil_vals[i] <- mean(ss[, 3], na.rm = TRUE)
+
+  # fuzziness (entropy of membership)
+  fuzz_vals[i] <- mean(
+    -rowSums(model$membership * log(model$membership)),
+    na.rm = TRUE
+  )
+}
+```
+
+```{r}
+plot(k_vals, sil_vals,
+     type = "b",
+     col = "blue",
+     ylab = "Score",
+     xlab = "k",
+     main = "Cluster validity")
+
+lines(k_vals, fuzz_vals, type = "b", col = "red")
+
+legend("topright",
+       legend = c("Silhouette", "Fuzziness (entropy)"),
+       col = c("blue", "red"),
+       lty = 1)
+```
+non-vsd data 
+
+1. create three dimensional matrix
+
+```{r build-and-clean-matrix}
+mat <- cbind(
+  time       = res_time$log2FoldChange,
+  exposure   = res_exposure$log2FoldChange,
+  interaction = res_interaction$log2FoldChange
+)
+
+rownames(mat) <- rownames(res_time)
+
+# Remove rows with NA
+mat_clean <- na.omit(mat)
+
+# Scale by row (gene-wise z-score)
+mat_scaled <- t(scale(t(mat_clean)))
+```
+
+2. silhouette widths
+
+```{r}
+library(cluster)
+library(factoextra)
+
+# Compute average silhouette width for k = 2:10
+fviz_nbclust(
+  mat_scaled,
+  kmeans,
+  method = "silhouette",
+  k.max = 10
+)
+```
+
+4 or 6 is probably correct
+
+```{r make-clusters}
+set.seed(123)
+
+km <- kmeans(mat_scaled, centers = 6)
+
+clusters <- km$cluster
+```
+
+```{r}
+clustered_mat <- data.frame(
+  mat_scaled,
+  cluster = factor(clusters)
+)
+```
+
+```{r}
+library(plotly)
+
+pca <- prcomp(mat_scaled)
+
+pca_df <- data.frame(
+  PC1 = pca$x[,1],
+  PC2 = pca$x[,2],
+  PC3 = pca$x[,3],
+  cluster = factor(clusters)
+)
+
+plot_ly(
+  pca_df,
+  x = ~PC1,
+  y = ~PC2,
+  z = ~PC3,
+  color = ~cluster,
+  type = "scatter3d",
+  mode = "markers"
+)
+```
+
+
+2. figure out clustering
+
+3. assign clusters
+
+4. project cluster scatterplot into three dimensional space
+
+
+
+```{r}
+library(pheatmap)
+
+pheatmap(
+  mat_scaled,
+  cluster_rows = TRUE,
+  show_rownames = FALSE
+)
+```
+```{r}
+matplot(
+  t(mat_scaled[1:100,]),
+  type = "l",
+  lty = 1,
+  xlab = "Condition",
+  ylab = "Scaled log2FC"
+)
+```
+
+## okay let's restart here
+project the clusters onto the log2fc 06h vs log2fc 24
+
+```{r}
+plot_df <- merge(
+  data.frame(
+    gene = rownames(res_06h_exposure),
+    log2FC_06h = res_06h_exposure$log2FoldChange
+  ),
+  
+  data.frame(
+    gene = rownames(res_24h_exposure),
+    log2FC_24h = res_24h_exposure$log2FoldChange
+  ),
+  
+  by = "gene"
+)
+```
+
+```{r}
+cluster_df <- data.frame(
+  gene = rownames(mat_scaled),
+  cluster = factor(clusters)
+)
+
+plot_df <- merge(plot_df, cluster_df, by = "gene")
+```
+
+```{r}
+library(ggplot2)
+
+
+ggplot(plot_df,
+       aes(log2FC_06h,
+           log2FC_24h,
+           color = cluster)) +
+  geom_point(alpha = 0.7) +
+  theme_classic() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")
+```
+
+##OR, using mfuzz for clusters
+
+```{r}
+library(Mfuzz)
+library(Biobase)
+
+# Convert to ExpressionSet
+eset <- ExpressionSet(assayData = as.matrix(mat_scaled))
+
+# Estimate fuzzifier
+m <- mestimate(eset)
+
+# Try different cluster numbers
+Dmin(eset, m, crange = 2:10, repeats = 3)
+```
+```{r}
+cl <- mfuzz(eset, c = 4, m = m)
+```
+
+
+```{r}
+mfuzz.plot(
+  eset,
+  cl = cl,
+  mfrow = c(2,2),
+  time.labels = colnames(mat_scaled)
+)
+```
+
+```{r}
+cl4 <- mfuzz(eset, c = 4, m = m)
+
+mfuzz.plot(eset,
+           cl = cl4,
+           mfrow = c(2,2),
+           time.labels = c("06h", "24h", "interaction"))
+```
+
+```{r}
+dev.new()
+
+mfuzz.plot(
+  eset,
+  cl = cl4,
+  mfrow = c(2,2),
+  time.labels = c("06h", "24h", "interaction")
+)
+```
+
+```{r}
+library(tidyverse)
+
+plot_long <- plot_df %>%
+  pivot_longer(
+    cols = c(log2FC_06h, log2FC_24h),
+    names_to = "time",
+    values_to = "log2FC"
+  )
+
+tt <-ggplot(plot_long,
+       aes(time,
+           log2FC,
+           group = gene,
+           color = cluster)) +
+  geom_line(alpha = 0.1) +
+  stat_summary(
+    aes(group = cluster),
+    fun = mean,
+    geom = "line",
+    linewidth = 2
+  ) +
+  facet_wrap(~cluster) +
+  theme_classic()
+tt
+```
+
+
+```{r}
+library(Mfuzz)
+library(tidyverse)
+
+m <- mestimate(eset)
+
+plot_list <- list()
+
+for (k in 3:7) {
+
+  set.seed(123)
+
+  # fuzzy clustering
+  cl <- mfuzz(eset, c = k, m = m)
+
+  # extract hard cluster assignment (max membership)
+  cluster_assign <- apply(cl$membership, 1, which.max)
+
+  plot_df_k <- plot_df %>%
+    mutate(cluster = factor(cluster_assign))
+
+  plot_long <- plot_df_k %>%
+    pivot_longer(
+      cols = c(log2FC_06h, log2FC_24h),
+      names_to = "time",
+      values_to = "log2FC"
+    )
+
+  p <- ggplot(plot_long,
+              aes(time,
+                  log2FC,
+                  group = gene,
+                  color = cluster)) +
+    geom_line(alpha = 0.1) +
+    stat_summary(
+      aes(group = cluster),
+      fun = mean,
+      geom = "line",
+      linewidth = 2
+    ) +
+    facet_wrap(~cluster) +
+    theme_classic() +
+    ggtitle(paste("Mfuzz clustering k =", k))
+
+  plot_list[[paste0("k_", k)]] <- p
+}
+```
+
+```{r}
+plot_list[["k_3"]]
+plot_list[["k_4"]]
+plot_list[["k_5"]]
+```
+```{r}
+plot_list[["k_6"]]
+plot_list[["k_7"]]
+```
+```{r}
+
+calc_separation <- function(membership_matrix) {
+  apply(membership_matrix, 1, function(x) {
+    sort_x <- sort(x, decreasing = TRUE)
+    sort_x[1] - sort_x[2]
+  })
+}
+```
+
+```{r}
+library(Mfuzz)
+
+m <- mestimate(eset)
+
+sep_summary <- data.frame()
+
+for (k in 2:10) {
+
+  set.seed(123)
+  cl <- mfuzz(eset, c = k, m = m)
+
+  sep <- calc_separation(cl$membership)
+
+  sep_summary <- rbind(
+    sep_summary,
+    data.frame(
+      k = k,
+      mean_separation = mean(sep, na.rm = TRUE),
+      median_separation = median(sep, na.rm = TRUE),
+      pct_low_sep = mean(sep < 0.2)
+    )
+  )
+}
+```
+
+```{r}
+sep_summary
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(sep_summary,
+       aes(x = k, y = mean_separation)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_classic() +
+  ylab("Mean cluster separation") +
+  xlab("Number of clusters (k)")
+```
+
+
+# on VSD
+```{r build-and-clean-matrix}
+mat <- cbind(
+  time       = res_time$log2FoldChange,
+  exposure   = res_exposure$log2FoldChange,
+  interaction = res_interaction$log2FoldChange
+)
+
+rownames(mat) <- rownames(res_time)
+
+# Remove rows with NA
+mat_clean <- na.omit(mat)
+
+# Scale by row (gene-wise z-score)
+mat_scaled <- t(scale(t(mat_clean)))
+```
+
+
+
+
+
+##############
+
+```{r vst-matrix}
+mat_vst <- assay(vst(dds, blind = TRUE))
+
+# optional: remove low-expression genes first
+mat_vst <- mat_vst[rowMeans(mat_vst) > 5, ]
+
+# remove zero-variance genes
+vst_var <- apply(mat_vst, 1, var)
+mat_vst <- mat_vst[vst_var > 0, ]
+
+# final safety check
+mat_vst <- mat_vst[complete.cases(mat_vst), ]
+```
+
+
+```{r lfc-matrix}
+mat_lfc <- cbind(
+  time = res_time$log2FoldChange,
+  exposure = res_exposure$log2FoldChange,
+  interaction = res_interaction$log2FoldChange
+)
+
+rownames(mat_lfc) <- rownames(res_time)
+
+# remove rows with NA or infinite values
+mat_lfc <- mat_lfc[is.finite(rowSums(mat_lfc)), ]
+mat_lfc <- mat_lfc[complete.cases(mat_lfc), ]
+
+# remove zero-variance genes
+lfc_var <- apply(mat_lfc, 1, var)
+mat_lfc <- mat_lfc[lfc_var > 0, ]
+```
+
+```{r shared-geneset}
+common_genes <- intersect(rownames(mat_vst), rownames(mat_lfc))
+
+mat_vst <- mat_vst[common_genes, ]
+mat_lfc <- mat_lfc[common_genes, ]
+```
+
+```{r}
+pca_vst <- prcomp(t(mat_vst), center = TRUE, scale. = FALSE)
+
+plot_ly(
+  x = pca_vst$x[,1],
+  y = pca_vst$x[,2],
+  z = pca_vst$x[,3],
+  type = "scatter3d",
+  mode = "markers"
+) %>%
+  layout(title = "PCA - VST space")
+
+```
+
+
+```{r}
+pca_lfc <- prcomp(t(mat_lfc), center = TRUE, scale. = TRUE)
+
+plot_ly(
+  x = pca_lfc$x[,1],
+  y = pca_lfc$x[,2],
+  z = pca_lfc$x[,3],
+  type = "scatter3d",
+  mode = "markers"
+) %>%
+  layout(title = "PCA - LFC space")
+```
+
+
+```{r check-pca-loadings}
+summary(pca_vst)
+```
+
+```{r}
+summary(pca_lfc)
+```
+
+```{r}
+library(Mfuzz)
+
+m <- mestimate(eset)
+
+k_values <- 3:7
+
+results <- data.frame()
+
+for (k in k_values) {
+
+  set.seed(123)
+  cl <- mfuzz(eset, c = k, m = m)
+
+  membership <- cl$membership
+  hard <- apply(membership, 1, which.max)
+
+  # separation score
+  sep <- apply(membership, 1, function(x) {
+    sort(x, decreasing = TRUE)[1] - sort(x, decreasing = TRUE)[2]
+  })
+
+  results <- rbind(results, data.frame(
+    k = k,
+    mean_separation = mean(sep),
+    median_separation = median(sep),
+    low_conf_pct = mean(sep < 0.2),
+    n_clusters = k
+  ))
+}
+
+results
+```
+
+
+
+# oh my fucking god
+
+```{r}
+vsd <- vst(dds, blind = TRUE)
+mat_vsd <- assay(vsd)
+
+# remove low-expression genes
+mat_vsd <- mat_vsd[apply(mat_vsd, 1, var) > 0, ]
+
+# remove NA / Inf rows (correct object!)
+mat_vsd <- mat_vsd[complete.cases(mat_vsd), ]
+
+# ensure numeric safety
+mat_vsd <- as.matrix(mat_vsd)
+storage.mode(mat_vsd) <- "numeric"
+
+```
+
+```{r define-function}
+evaluate_k <- function(k, m) {
+
+  eset <- ExpressionSet(assayData = mat_vsd)
+
+  cl <- mfuzz(eset, c = k, m = m)
+
+  membership <- cl$membership
+
+  sep <- apply(membership, 1, function(x) {
+    sort(x, decreasing = TRUE)[1] - sort(x, decreasing = TRUE)[2]
+  })
+
+  hard <- apply(membership, 1, which.max)
+
+  pca <- prcomp(mat_vsd, center = TRUE, scale. = TRUE)
+  dist_pca <- dist(pca$x[, 1:5])
+
+  sil <- silhouette(hard, dist_pca)
+
+  data.frame(
+    k = k,
+    mean_fuzzy_sep = mean(sep, na.rm = TRUE),
+    silhouette = mean(sil[, 3], na.rm = TRUE),
+    prop_ambiguous = mean(sep < 0.2, na.rm = TRUE)
+  )
+}
+```
+
+```{r}
+m <- mestimate(ExpressionSet(assayData = mat_vsd))
+
+results <- do.call(rbind, lapply(3:7, function(k) {
+  evaluate_k(k, m)
+}))
+```
+
+
+
+
+```{r}
+eset <- ExpressionSet(assayData = mat_vsd)
+m <- mestimate(eset)
+```
+
+```{r}
+get_plot_df <- function(k, m) {
+
+  cl <- mfuzz(eset, c = k, m = m)
+
+  cluster <- apply(cl$membership, 1, which.max)
+
+  data.frame(
+    gene = rownames(mat_vsd),
+    log2FC_06h = mat_lfc[, "time"],
+    log2FC_24h = mat_lfc[, "exposure"],
+    cluster = factor(cluster),
+    k = k
+  )
+}
+```
+
+```{r}
+plot_list <- lapply(3:7, function(k) get_plot_df(k, m))
+
+plot_df_all <- do.call(rbind, plot_list)
+```
+
+
+#######
+
+```{r}
+mat_lfc <- cbind(
+  time = res_time$log2FoldChange,
+  exposure = res_exposure$log2FoldChange,
+  interaction = res_interaction$log2FoldChange
+)
+```
+
+##### for fucking fuck's sake
+
+```{r}
+common_genes <- intersect(rownames(mat_vsd), rownames(mat_lfc))
+
+mat_vsd <- mat_vsd[common_genes, ]
+mat_lfc <- mat_lfc[common_genes, ]
+```
+
+```{r}
+mat_lfc <- as.matrix(mat_lfc)
+storage.mode(mat_lfc) <- "numeric"
+
+mat_lfc <- mat_lfc[complete.cases(mat_lfc), ]
+mat_lfc <- mat_lfc[apply(mat_lfc, 1, var) > 0, ]
+```
+
+```{r}
+library(Mfuzz)
+
+eset <- ExpressionSet(assayData = mat_lfc)
+m <- mestimate(eset)
+```
+
+```{r}
+evaluate_k <- function(k, m) {
+
+  cl <- mfuzz(eset, c = k, m = m)
+
+  membership <- cl$membership
+
+  sep <- apply(membership, 1, function(x) {
+    sort(x, decreasing = TRUE)[1] - sort(x, decreasing = TRUE)[2]
+  })
+
+  hard <- apply(membership, 1, which.max)
+
+  # PCA in LFC space (3D geometry preserved)
+  pca <- prcomp(mat_lfc, center = TRUE, scale. = TRUE)
+
+  d <- dist(pca$x[, 1:3])
+  sil <- silhouette(hard, d)
+
+  data.frame(
+    k = k,
+    silhouette = mean(sil[, 3]),
+    fuzzy_sep = mean(sep),
+    ambiguity = mean(sep < 0.2)
+  )
+}
+```
+
+```{r}
+results <- do.call(rbind, lapply(3:7, function(k) evaluate_k(k, m)))
+results
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+mat_lfc <- as.matrix(mat_lfc)
+storage.mode(mat_lfc) <- "numeric"
+```
+
+```{r}
+library(Mfuzz)
+
+eset <- ExpressionSet(assayData = mat_lfc)
+m <- mestimate(eset)
+```
+
+```{r}
+get_plot_df <- function(k, m) {
+
+  set.seed(123)
+
+  cl <- mfuzz(eset, c = k, m = m)
+
+  cluster <- apply(cl$membership, 1, which.max)
+
+  data.frame(
+    gene = rownames(mat_lfc),
+    log2FC_06h = mat_lfc[, "time"],
+    log2FC_24h = mat_lfc[, "exposure"],
+    interaction = mat_lfc[, "interaction"],
+    cluster = factor(cluster),
+    k = k
+  )
+}
+```
+
+```{r}
+plot_df_all <- do.call(
+  rbind,
+  lapply(3:7, function(k) get_plot_df(k, m))
+)
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(plot_df_all,
+       aes(x = log2FC_06h,
+           y = log2FC_24h,
+           color = cluster)) +
+  geom_point(alpha = 0.6, size = 1) +
+  facet_wrap(~k) +
+  theme_classic() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")
+```
+```{r}
+library(cluster)
+library(Mfuzz)
+
+eset <- ExpressionSet(assayData = mat_lfc)
+m <- mestimate(eset)
+```
+
+```{r}
+sil_scores <- sapply(3:7, function(k) {
+
+  set.seed(123)
+
+  cl <- mfuzz(eset, c = k, m = m)
+
+  hard <- apply(cl$membership, 1, which.max)
+
+  pca <- prcomp(mat_lfc, center = TRUE, scale. = TRUE)
+
+  d <- dist(pca$x[, 1:3])
+
+  mean(silhouette(hard, d)[, 3])
+})
+```
+
+```{r}
+get_traj_df <- function(k, m) {
+
+  set.seed(123)
+
+  cl <- mfuzz(eset, c = k, m = m)
+
+  membership <- cl$membership
+
+  cluster <- apply(membership, 1, which.max)
+
+  plot_long <- data.frame(
+    gene = rownames(mat_lfc),
+    time = rep(colnames(mat_lfc), each = nrow(mat_lfc)),
+    value = as.vector(t(mat_lfc)),
+    cluster = rep(cluster, times = ncol(mat_lfc)),
+    k = k
+  )
+
+  plot_long
+}
+```
+
+```{r}
+traj_all <- do.call(
+  rbind,
+  lapply(3:7, function(k) get_traj_df(k, m))
+)
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(traj_all,
+       aes(x = time,
+           y = value,
+           group = gene,
+           color = factor(cluster))) +
+  geom_line(alpha = 0.05) +
+  stat_summary(aes(group = cluster),
+               fun = mean,
+               geom = "line",
+               linewidth = 1.5) +
+  facet_wrap(~k) +
+  theme_classic()
+```
+
+```{r}
+plot_df <- plot_df[match(rownames(eset), plot_df$gene), ]
+```
+
+```{r}
+library(Mfuzz)
+library(tidyverse)
+
+m <- mestimate(eset)
+
+plot_list <- list()
+```
+
+
+#######
+
+```{r}
+mat_lfc <- as.matrix(mat_lfc)
+storage.mode(mat_lfc) <- "numeric"
+
+mat_lfc <- mat_lfc[complete.cases(mat_lfc), ]
+mat_lfc <- mat_lfc[apply(mat_lfc, 1, var) > 0, ]
+```
+
+```{r}
+library(Biobase)
+
+eset <- ExpressionSet(assayData = mat_lfc)
+```
+
+```{r}
+dim(eset)
+head(exprs(eset))
+```
+
+```{r}
+all(rownames(mat_lfc) == rownames(exprs(eset)))
+```
+
+```{r}
+m <- mestimate(eset)
+```
+
+## SWITCH IT UP
+
+filter genes from the contrasts to build the background universe
+
+```{r}
+# Define thresholds
+p_cutoff <- 0.05
+lfc_cutoff <- 0.5  # Adjust this to 0 if you want to filter purely on padj
+
+# Find significant genes per axis
+sig_time <- rownames(subset(res_time, padj < p_cutoff & abs(log2FoldChange) >= lfc_cutoff))
+sig_exposure <- rownames(subset(res_exposure, padj < p_cutoff & abs(log2FoldChange) >= lfc_cutoff))
+sig_interaction <- rownames(subset(res_interaction, padj < p_cutoff & abs(log2FoldChange) >= lfc_cutoff))
+
+# Combine to create your final clustering universe (Union)
+clustering_universe <- unique(c(sig_time, sig_exposure, sig_interaction))
+
+# Build the 3D Matrix with this specific universe
+df_3d <- data.frame(
+  LFC_time = res_time[clustering_universe, "log2FoldChange"],
+  LFC_exposure = res_exposure[clustering_universe, "log2FoldChange"],
+  LFC_interaction = res_interaction[clustering_universe, "log2FoldChange"],
+  row.names = clustering_universe
+)
+
+cat("Number of genes in your clustering universe:", nrow(df_3d), "\n")
+```
+```{r}
+# Load required packages
+library(Mfuzz)
+library(cluster)
+library(ggplot2)
+
+# 1. Convert our 3D dataframe to a Matrix and then an ExpressionSet
+mat_3d <- as.matrix(df_3d)
+eset_3d <- new("ExpressionSet", exprs = mat_3d)
+
+# 2. Estimate the fuzzifier parameter (m)
+# This controls how "fuzzy" the boundaries between clusters are.
+m_est <- mestimate(eset_3d)
+cat("Estimated fuzzifier (m):", m_est, "\n")
+
+# 3. Calculate Silhouette Scores for k = 2 through 10
+k_range <- 2:10
+avg_sil_widths <- numeric(length(k_range))
+
+# We use e1071::cmeans because Mfuzz is built on top of it
+set.seed(42) # For reproducibility
+for (i in seq_along(k_range)) {
+  k_val <- k_range[i]
+  
+  # Run fuzzy c-means
+  fcm_res <- e1071::cmeans(mat_3d, centers = k_val, m = m_est, method = "cmeans")
+  
+  # Calculate silhouette widths based on the hardest cluster assignment
+  sil_res <- silhouette(fcm_res$cluster, dist(mat_3d))
+  avg_sil_widths[i] <- mean(sil_res[, "sil_width"])
+}
+
+# 4. Plot the Silhouette Scores to visually evaluate the optimal K
+df_sil <- data.frame(k = k_range, avg_silhouette = avg_sil_widths)
+
+ggplot(df_sil, aes(x = k, y = avg_silhouette)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(color = "darkblue", size = 3) +
+  scale_x_continuous(breaks = k_range) +
+  theme_minimal() +
+  labs(
+    title = "Silhouette Analysis for Optimal K",
+    x = "Number of Clusters (k)",
+    y = "Average Silhouette Width"
+  )
+```
+
+Local peak at 7/8, major dropoff at 9
+
+```{r}
+# 1. Run the final Mfuzz clustering with k = 7
+set.seed(42) # For reproducibility
+mfuzz_res <- mfuzz(eset_3d, centers = 8, m = m_est)
+
+# 2. Extract membership values and cluster assignments
+# 'membership' is a matrix showing how strongly each gene belongs to each of the 7 clusters
+membership_matrix <- mfuzz_res$membership
+
+# Assign each gene to its single highest-scoring cluster (hard clustering assignment)
+gene_cluster_assignments <- data.frame(
+  gene_id = rownames(mat_3d),
+  cluster = mfuzz_res$cluster
+)
+
+# 3. Quick check: how many genes are in each of the 7 clusters?
+table(gene_cluster_assignments$cluster)
+```
+
+```{r}
+# ==========================================
+# 1. EXTRACT TRUE MODEL-DERIVED LFC VALUES
+# ==========================================
+
+# Axis X: True Log2FC at 06h (Main effect of exposure)
+res_LFC_06h <- res_06h_exposure
+# Axis Y: True Log2FC at 24h 
+# We use the 'contrast' argument to cleanly extract: (Exposure at 24h) - (Control at 24h)
+res_LFC_24h <- res_24h_exposure
+# ==========================================
+# 2. BUILD THE PLOTTING DATAFRAME
+# ==========================================
+df_model_lfc <- data.frame(
+  gene_id = clustering_universe,
+  model_LFC_06h = res_LFC_06h[clustering_universe, "log2FoldChange"],
+  model_LFC_24h = res_LFC_24h[clustering_universe, "log2FoldChange"]
+)
+
+# Merge with the Mfuzz clusters (k = 8)
+df_final_plot <- inner_join(df_model_lfc, gene_clusters, by = "gene_id")
+
+# ==========================================
+# 3. PLOT THE 2D LFC SCATTERPLOT
+# ==========================================
+ggplot(df_final_plot, aes(x = model_LFC_06h, y = model_LFC_24h, color = cluster)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  # Add a diagonal line to easily identify time-dependent changes
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "gray40") +
+  scale_color_brewer(palette = "Set1") + 
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Mfuzz 3D Clusters Projecting onto 2D LFC Space",
+    subtitle = "Model-derived Log2 Fold Changes (Exposed vs Control)",
+    x = "Log2 Fold Change at 06h",
+    y = "Log2 Fold Change at 24h",
+    color = "Cluster"
+  ) +
+  coord_fixed()
+```
+
+
+
+
+```{r}
+library(DESeq2)
+library(Mfuzz)
+library(tidyverse)
+
+# ==========================================
+# 1. RUN MFUZZ WITH K = 8
+# ==========================================
+set.seed(42)
+k_opt <- 8
+mfuzz_res <- mfuzz(eset_3d, centers = k_opt, m = m_est)
+
+# Extract cluster assignments
+gene_clusters <- data.frame(
+  gene_id = rownames(mat_3d),
+  cluster = as.factor(mfuzz_res$cluster)
+)
+
+print(table(gene_clusters$cluster))
+
+# ==========================================
+# 2. CALCULATE 2D FOLD CHANGES FROM VSD
+# ==========================================
+# Extract the VSD expression matrix (log2-like scale)
+vsd_mat <- assay(vsd) 
+
+# Get sample metadata to map columns correctly
+meta <- as.data.frame(colData(vsd))
+
+# Add sample IDs as a column for easy grouping
+meta$sample_id <- rownames(meta)
+
+# We will average the replicates for our 4 distinct experimental groups
+group_means <- unique(interaction(meta$exposure, meta$time))
+
+# Function to safely get mean expression for a specific condition
+get_group_mean <- function(exp_val, time_val) {
+  samples <- meta$sample_id[meta$exposure == exp_val & meta$time == time_val]
+  if(length(samples) == 1) {
+    return(vsd_mat[clustering_universe, samples])
+  } else {
+    return(rowMeans(vsd_mat[clustering_universe, samples]))
+  }
+}
+
+# Calculate the mean VSD values for our 4 groups across our 4,900 genes
+mean_ctrl_06 <- get_group_mean("control", "06h")
+mean_exp_06  <- get_group_mean("exposed", "06h")
+mean_ctrl_24 <- get_group_mean("control", "24h")
+mean_exp_24  <- get_group_mean("exposed", "24h")
+
+# Calculate the 2D Fold Changes
+df_2d <- data.frame(
+  gene_id = clustering_universe,
+  vsd_LFC_06h = mean_exp_06 - mean_ctrl_06,
+  vsd_LFC_24h = mean_exp_24 - mean_ctrl_24
+)
+
+# Merge with our Mfuzz cluster assignments
+df_plot <- inner_join(df_2d, gene_clusters, by = "gene_id")
+
+# ==========================================
+# 3. PLOT THE 2D SCATTERPLOT
+# ==========================================
+ggplot(df_plot, aes(x = vsd_LFC_06h, y = vsd_LFC_24h, color = cluster)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_brewer(palette = "Set1") + # Distinct colors for 8 clusters
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Projection of Mfuzz 3D Clusters onto 2D Space",
+    subtitle = "VSD-derived Log2 Fold Changes (Exposed vs Control)",
+    x = "Log2 Fold Change at 06h",
+    y = "Log2 Fold Change at 24h",
+    color = "Cluster"
+  ) +
+  theme(legend.position = "right") +
+  coord_fixed() # Keeps the scales uniform on both axes
+```
+
+```{r}
+# 1. Keep the exact same group means we calculated using the correct levels
+mean_ctrl_06 <- rowMeans(vsd_mat[clustering_universe, group_list[["Control.06h"]]])
+mean_exp_06  <- rowMeans(vsd_mat[clustering_universe, group_list[["Exposed.06h"]]])
+mean_ctrl_24 <- rowMeans(vsd_mat[clustering_universe, group_list[["Control.24h"]]])
+mean_exp_24  <- rowMeans(vsd_mat[clustering_universe, group_list[["Exposed.24h"]]])
+
+# 2. Build the dataframe using the ABSOLUTE expression values 
+# Let's look at the trajectories of the EXPOSED samples over time, 
+# or you could swap these out for the Control samples.
+df_absolute_vsd <- data.frame(
+  gene_id = clustering_universe,
+  vsd_expression_06h = mean_exp_06, # Absolute VSD value at 6h
+  vsd_expression_24h = mean_exp_24  # Absolute VSD value at 24h
+)
+
+# 3. Merging with the Mfuzz clusters
+df_plot_vsd <- inner_join(df_absolute_vsd, gene_clusters, by = "gene_id")
+
+# 4. Plotting absolute expression trajectories
+ggplot(df_plot_vsd, aes(x = vsd_expression_06h, y = vsd_expression_24h, color = cluster)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  # Add a diagonal line: genes on this line have identical expression at both timepoints
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  scale_color_brewer(palette = "Set1") + 
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Projection of 3D Clusters onto Absolute VSD Expression",
+    subtitle = "Exposed Group: 06h vs 24h",
+    x = "Variance Stabilized Expression at 06h",
+    y = "Variance Stabilized Expression at 24h",
+    color = "Cluster"
+  ) +
+  coord_fixed()
+```
+
+```{r}
+# ==========================================
+# 0. CONFIGURATION: SET YOUR K VALUE HERE
+# ==========================================
+k_val <- 7  # <-- Change this single number to dynamically update the whole block
+
+# ==========================================
+# 1. RUN MFUZZ CLUSTERING DYNAMICALLY
+# ==========================================
+set.seed(42) # For reproducibility
+mfuzz_out <- mfuzz(eset_3d, centers = k_val, m = m_est)
+
+# Update the gene cluster assignments mapping
+gene_clusters_dynamic <- data.frame(
+  gene_id = rownames(exprs(eset_3d)),
+  cluster = as.factor(mfuzz_out$cluster)
+)
+
+# Print the breakdown of cluster sizes to the console
+message(paste("--- Cluster Sizes for K =", k_val, "---"))
+print(table(gene_clusters_dynamic$cluster))
+
+# ==========================================
+# 2. BUILD THE PLOTTING DATAFRAME
+# ==========================================
+# Axis X: True Log2FC at 06h (Main effect of exposure)
+res_LFC_06h <- res_06h_exposure
+
+# Axis Y: True Log2FC at 24h 
+res_LFC_24h <- res_24h_exposure
+
+df_model_lfc <- data.frame(
+  gene_id = clustering_universe,
+  model_LFC_06h = res_LFC_06h[clustering_universe, "log2FoldChange"],
+  model_LFC_24h = res_LFC_24h[clustering_universe, "log2FoldChange"]
+)
+
+# Merge with the dynamic Mfuzz clusters
+df_final_plot <- inner_join(df_model_lfc, gene_clusters_dynamic, by = "gene_id")
+
+# ==========================================
+# 3. PLOT THE 2D LFC SCATTERPLOT
+# ==========================================
+ggplot(df_final_plot, aes(x = model_LFC_06h, y = model_LFC_24h, color = cluster)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  # Add a diagonal line to easily identify time-dependent changes
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "gray40") +
+  # Using scale_color_discrete() so it doesn't break if K exceeds ColorBrewer limits
+  scale_color_discrete() + 
+  theme_minimal(base_size = 14) +
+  labs(
+    title = paste("Mfuzz 3D Clusters Projecting onto 2D LFC Space (K =", k_val, ")"),
+    subtitle = "Model-derived Log2 Fold Changes (Exposed vs Control)",
+    x = "Log2 Fold Change at 06h",
+    y = "Log2 Fold Change at 24h",
+    color = "Cluster"
+  ) +
+  coord_fixed()
+```
+
+```{r}
+# Make sure you have these packages installed for high-contrast colors
+# install.packages("pals") 
+# install.packages("plotly") # Optional, for interactive hovering
+
+library(pals)
+library(plotly)
+
+# ==========================================
+# 0. CONFIGURATION: SET K AND PALETTE HERE
+# ==========================================
+k_val <- 7  
+
+# Choose your style: 
+# "glasbey"  -> Maximum distinctness (Up to 32 completely different colors)
+# "kelly"    -> High contrast classic palette
+# "turbo"    -> Vibrant, continuous-looking rainbow with distinct saturation
+palette_type <- "glasbey" 
+
+# ==========================================
+# 1. RUN MFUZZ CLUSTERING DYNAMICALLY
+# ==========================================
+set.seed(42) 
+mfuzz_out <- mfuzz(eset_3d, centers = k_val, m = m_est)
+
+gene_clusters_dynamic <- data.frame(
+  gene_id = rownames(exprs(eset_3d)),
+  cluster = as.factor(mfuzz_out$cluster)
+)
+
+# ==========================================
+# 2. BUILD THE PLOTTING DATAFRAME
+# ==========================================
+res_LFC_06h <- res_06h_exposure
+res_LFC_24h <- res_24h_exposure
+
+df_model_lfc <- data.frame(
+  gene_id = clustering_universe,
+  model_LFC_06h = res_LFC_06h[clustering_universe, "log2FoldChange"],
+  model_LFC_24h = res_LFC_24h[clustering_universe, "log2FoldChange"]
+)
+
+df_final_plot <- inner_join(df_model_lfc, gene_clusters_dynamic, by = "gene_id")
+
+# ==========================================
+# 3. SET UP THE COLOR PALETTE DYNAMICALLY
+# ==========================================
+color_vector <- switch(palette_type,
+  "glasbey" = as.vector(pals::glasbey(k_val)),
+  "kelly"   = as.vector(pals::kelly(k_val + 1)[-1]), # Drop white/black baseline
+  "turbo"   = as.vector(pals::turbo(k_val))
+)
+
+# ==========================================
+# 4. PLOT THE 2D LFC SCATTERPLOT
+# ==========================================
+p <- ggplot(df_final_plot, aes(x = model_LFC_06h, y = model_LFC_24h, color = cluster, text = gene_id)) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "gray40") +
+  # Inject our high-contrast color vector
+  scale_color_manual(values = color_vector) + 
+  theme_minimal(base_size = 14) +
+  labs(
+    title = paste("Mfuzz 3D Clusters on 2D LFC Space (K =", k_val, ")"),
+    subtitle = paste("Palette:", palette_type),
+    x = "Log2 Fold Change at 06h",
+    y = "Log2 Fold Change at 24h",
+    color = "Cluster"
+  ) +
+  coord_fixed() +
+  theme(legend.position = "right")
+
+# Display the static plot
+print(p)
+
+# OPTIONAL: Uncomment the line below to make the plot fully interactive in RStudio!
+# ggplotly(p, tooltip = "text")
+```
+
+```{r}
+# Ensure you have plotly installed: install.packages("plotly")
+library(paletteer)
+library(plotly)
+
+# ==========================================
+# 0. CONFIGURATION: SET K AND PALETTE HERE
+# ==========================================
+k_val <- 6  
+
+# Using paletteer to select a highly distinct 10-color palette
+# Feel free to change this to "awtools::mpalette" or "colorblindr::OkabeIto"
+chosen_palette <- "ggthemes::Classic_10"
+
+# ==========================================
+# 1. RUN MFUZZ CLUSTERING DYNAMICALLY
+# ==========================================
+set.seed(42) 
+mfuzz_out <- mfuzz(eset_3d, centers = k_val, m = m_est)
+
+gene_clusters_dynamic <- data.frame(
+  gene_id = rownames(exprs(eset_3d)),
+  cluster = as.factor(mfuzz_out$cluster)
+)
+
+# ==========================================
+# 2. BUILD THE PLOTTING DATAFRAME
+# ==========================================
+res_LFC_06h <- res_06h_exposure
+res_LFC_24h <- res_24h_exposure
+
+df_model_lfc <- data.frame(
+  gene_id = clustering_universe,
+  model_LFC_06h = res_LFC_06h[clustering_universe, "log2FoldChange"],
+  model_LFC_24h = res_LFC_24h[clustering_universe, "log2FoldChange"]
+)
+
+df_final_plot <- inner_join(df_model_lfc, gene_clusters_dynamic, by = "gene_id")
+
+# ==========================================
+# 3. BUILD THE STATIC GGPLOT
+# ==========================================
+# Crucial: We add a 'text' aesthetic mapping inside aes(). 
+# This tells plotly exactly what to display in the hover tooltip box.
+p_static <- ggplot(df_final_plot, aes(
+    x = model_LFC_06h, 
+    y = model_LFC_24h, 
+    color = cluster,
+    text = paste0(
+      "<b>Gene:</b> ", gene_id, "<br>",
+      "<b>Cluster:</b> ", cluster, "<br>",
+      "<b>LFC 06h:</b> ", round(model_LFC_06h, 3), "<br>",
+      "<b>LFC 24h:</b> ", round(model_LFC_24h, 3)
+    )
+  )) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "gray40") +
+  scale_color_paletteer_d(chosen_palette) + 
+  theme_minimal(base_size = 12) +
+  labs(
+    title = paste("Interactive Mfuzz 3D Clusters Projected onto 2D LFC Space (K =", k_val, ")"),
+    x = "Log2 Fold Change at 06h",
+    y = "Log2 Fold Change at 24h",
+    color = "Cluster"
+  )
+
+# ==========================================
+# 4. CONVERT TO INTERACTIVE PLOTLY
+# ==========================================
+# 'tooltip = "text"' tells plotly to ONLY show our custom formatted string on hover
+p_interactive <- ggplotly(p_static, tooltip = "text") %>%
+  # This option ensures the 1:1 aspect ratio layout carries over perfectly into plotly
+  layout(yaxis = list(scaleanchor = "x", scaleratio = 1))
+
+# Display the interactive plot in your RStudio Viewer or RMarkdown output
+p_interactive
+```
+
+```{r}
+# Make sure you have these installed: 
+# install.packages("pals")
+# install.packages("plotly")
+
+library(pals)
+library(plotly)
+
+# ==========================================
+# 0. CONFIGURATION: SET YOUR K VALUE HERE
+# ==========================================
+k_val <- 7  # <-- Change this single number to dynamically update everything
+
+# Choose your pals palette: 
+# "glasbey" -> Max distinctness (adjacent clusters get radically different colors)
+# "kelly"   -> Classic maximum-contrast palette
+chosen_pals_style <- "glasbey"
+
+# ==========================================
+# 1. RUN MFUZZ CLUSTERING DYNAMICALLY
+# ==========================================
+set.seed(42) # For reproducibility
+mfuzz_out <- mfuzz(eset_3d, centers = k_val, m = m_est)
+
+# Update the gene cluster assignments mapping
+gene_clusters_dynamic <- data.frame(
+  gene_id = rownames(exprs(eset_3d)),
+  cluster = as.factor(mfuzz_out$cluster)
+)
+
+# Print the breakdown of cluster sizes to the console
+message(paste("--- Cluster Sizes for K =", k_val, "---"))
+print(table(gene_clusters_dynamic$cluster))
+
+# ==========================================
+# 2. BUILD THE PLOTTING DATAFRAME
+# ==========================================
+res_LFC_06h <- res_06h_exposure
+res_LFC_24h <- res_24h_exposure
+
+df_model_lfc <- data.frame(
+  gene_id = clustering_universe,
+  model_LFC_06h = res_LFC_06h[clustering_universe, "log2FoldChange"],
+  model_LFC_24h = res_LFC_24h[clustering_universe, "log2FoldChange"]
+)
+
+# Merge with the dynamic Mfuzz clusters
+df_final_plot <- inner_join(df_model_lfc, gene_clusters_dynamic, by = "gene_id")
+
+# ==========================================
+# 3. EXTRACT THE PALS COLOR VECTOR
+# ==========================================
+color_vector <- switch(chosen_pals_style,
+  "glasbey" = as.vector(pals::glasbey(k_val)),
+  "kelly"   = as.vector(pals::kelly(k_val + 1)[-1]) # Drops the baseline white/black
+)
+
+# ==========================================
+# 4. BUILD THE STATIC GGPLOT GRAPHIC
+# ==========================================
+p_static <- ggplot(df_final_plot, aes(
+    x = model_LFC_06h, 
+    y = model_LFC_24h, 
+    color = cluster,
+    text = paste0(
+      "<b>Gene:</b> ", gene_id, "<br>",
+      "<b>Cluster:</b> ", cluster, "<br>",
+      "<b>LFC 06h:</b> ", round(model_LFC_06h, 3), "<br>",
+      "<b>LFC 24h:</b> ", round(model_LFC_24h, 3)
+    )
+  )) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "gray40") +
+  # Force our custom pals high-contrast colors
+  scale_color_manual(values = color_vector) + 
+  theme_minimal(base_size = 12) +
+  labs(
+    title = paste("Interactive Mfuzz 3D Clusters Projected onto 2D LFC Space (K =", k_val, ")"),
+    subtitle = paste("Color Profile:", chosen_pals_style),
+    x = "Log2 Fold Change at 06h",
+    y = "Log2 Fold Change at 24h",
+    color = "Cluster"
+  )
+
+# ==========================================
+# 5. CONVERT TO INTERACTIVE HTML WIDGET
+# ==========================================
+p_interactive <- ggplotly(p_static, tooltip = "text") %>%
+  # Ensures the coordinate aspect ratio stays perfectly square (1:1) in the browser
+  layout(yaxis = list(scaleanchor = "x", scaleratio = 1))
+
+# Run this to render the plot
+p_interactive
+```
+
+
+filter out genes only significant wrt time
+
+```{r}
+library(pals)
+library(plotly)
+
+# ==========================================
+# 0. CONFIGURATION: SET YOUR K VALUE HERE
+# ==========================================
+k_val <- 7  
+chosen_pals_style <- "glasbey"
+p_cutoff <- 0.05
+
+# ==========================================
+# 1. SURGICAL UNIVERSE FILTERING (NO TIME-ONLY GENES)
+# ==========================================
+# Extract all significant genes per contrast
+sig_time        <- rownames(subset(res_time,        padj < p_cutoff))
+sig_exposure    <- rownames(subset(res_exposure,    padj < p_cutoff))
+sig_interaction <- rownames(subset(res_interaction, padj < p_cutoff))
+
+# Define your new universe: Significant for Exposure OR Interaction
+# (This automatically drops genes that are ONLY significant for time)
+treatment_universe <- unique(c(sig_exposure, sig_interaction))
+
+cat("Original universe size with time-only genes:", length(unique(c(sig_time, sig_exposure, sig_interaction))), "\n")
+cat("Refined universe size (Treatment-responsive only):", length(treatment_universe), "\n")
+
+# ==========================================
+# 2. RE-BUILD THE 3D EXPRESSION SET FOR MFUZZ
+# ==========================================
+# We must subset our original 3D matrix to match this new treatment_universe
+mat_3d_refined <- mat_3d[rownames(mat_3d) %in% treatment_universe, ]
+eset_3d_refined <- new("ExpressionSet", exprs = mat_3d_refined)
+
+# Re-estimate the fuzzifier parameter for this cleaner dataset
+m_est_refined <- mestimate(eset_3d_refined)
+
+# ==========================================
+# 3. RUN MFUZZ ON REFINED DATA
+# ==========================================
+set.seed(42) 
+mfuzz_out <- mfuzz(eset_3d_refined, centers = k_val, m = m_est_refined)
+
+gene_clusters_dynamic <- data.frame(
+  gene_id = rownames(exprs(eset_3d_refined)),
+  cluster = as.factor(mfuzz_out$cluster)
+)
+
+message(paste("--- Refined Cluster Sizes for K =", k_val, "---"))
+print(table(gene_clusters_dynamic$cluster))
+
+# ==========================================
+# 4. BUILD THE PLOTTING DATAFRAME
+# ==========================================
+res_LFC_06h <- res_06h_exposure
+res_LFC_24h <- res_24h_exposure
+
+df_model_lfc <- data.frame(
+  gene_id = treatment_universe,
+  model_LFC_06h = res_LFC_06h[treatment_universe, "log2FoldChange"],
+  model_LFC_24h = res_LFC_24h[treatment_universe, "log2FoldChange"]
+)
+
+df_final_plot <- inner_join(df_model_lfc, gene_clusters_dynamic, by = "gene_id")
+
+# ==========================================
+# 5. PLOT THE NEW INTERACTIVE SCATTERPLOT
+# ==========================================
+color_vector <- switch(chosen_pals_style,
+  "glasbey" = as.vector(pals::glasbey(k_val)),
+  "kelly"   = as.vector(pals::kelly(k_val + 1)[-1])
+)
+
+p_static <- ggplot(df_final_plot, aes(
+    x = model_LFC_06h, 
+    y = model_LFC_24h, 
+    color = cluster,
+    text = paste0(
+      "<b>Gene:</b> ", gene_id, "<br>",
+      "<b>Cluster:</b> ", cluster, "<br>",
+      "<b>LFC 06h:</b> ", round(model_LFC_06h, 3), "<br>",
+      "<b>LFC 24h:</b> ", round(model_LFC_24h, 3)
+    )
+  )) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "gray40") +
+  scale_color_manual(values = color_vector) + 
+  theme_minimal(base_size = 12) +
+  labs(
+    title = paste("Treatment-Only Mfuzz Clusters on 2D LFC Space (K =", k_val, ")"),
+    subtitle = "Dropped baseline time-only genes",
+    x = "Log2 Fold Change at 06h",
+    y = "Log2 Fold Change at 24h",
+    color = "Cluster"
+  )
+
+p_interactive <- ggplotly(p_static, tooltip = "text") %>%
+  layout(yaxis = list(scaleanchor = "x", scaleratio = 1))
+
+p_interactive
+```
+
+```{r}
+# ==========================================
+# DIAGNOSTIC: ASSESS NEW OPTIMAL K
+# ==========================================
+library(Mfuzz)
+
+# Define a range of cluster numbers to test
+k_range <- 3:10
+distances <- numeric(length(k_range))
+
+# Loop through and calculate the minimum distance between cluster centroids for each K
+set.seed(42)
+for (i in seq_along(k_range)) {
+  k_test <- k_range[i]
+  cl_test <- mfuzz(eset_3d_refined, centers = k_test, m = m_est_refined)
+  # Calculate overlap/distance between centers
+  distances[i] <- min(dist(cl_test$centers))
+}
+
+# Create a clean diagnostic summary table
+k_evaluation <- data.frame(
+  K = k_range,
+  Min_Centroid_Distance = round(distances, 4)
+)
+
+print("--- Centroid Distance Evaluation Table ---")
+print(k_evaluation)
+
+# Plot the 'Elbow' style curve
+plot(k_range, distances, type = "b", pch = 19, col = "darkblue",
+     xlab = "Number of Clusters (K)", ylab = "Minimum Distance Between Centroids",
+     main = "Mfuzz K-Selection Curve (Refined Data)")
+```
+
+# with lfc shrinkage
+
+```{r}
+# ==========================================
+# DIAGNOSTIC: ASSESS K FOR SHRUNKEN DATA
+# ==========================================
+library(Mfuzz)
+
+# Define a range of cluster numbers to test on the shrunken data
+k_range <- 3:10
+distances_shrunk <- numeric(length(k_range))
+
+# Loop through and calculate the minimum distance between cluster centroids
+set.seed(42)
+for (i in seq_along(k_range)) {
+  k_test <- k_range[i]
+  cl_test <- mfuzz(eset_3d_refined, centers = k_test, m = m_est_refined)
+  # Calculate the minimum Euclidean distance between any two cluster centers
+  distances_shrunk[i] <- min(dist(cl_test$centers))
+}
+
+# Generate the evaluation table
+k_evaluation_shrunk <- data.frame(
+  K = k_range,
+  Min_Centroid_Distance = round(distances_shrunk, 4)
+)
+
+print("--- Post-Shrinkage Centroid Distance Evaluation ---")
+print(k_evaluation_shrunk)
+
+# Plot the new curve
+plot(k_range, distances_shrunk, type = "b", pch = 19, col = "darkred",
+     xlab = "Number of Clusters (K)", ylab = "Minimum Distance Between Centroids",
+     main = "Mfuzz K-Selection Curve (Shrunken + Refined Data)")
+```
+```{r}
+library(tidyverse)
+library(tidyverse)
+library(plotly)
+library(pals)
+
+# ==========================================
+# 0. RE-BUILD MASTER DATA WITH EXACT COLUMN NAMES
+# ==========================================
+df_plot_master <- data.frame(
+  gene_id       = treatment_universe,
+  model_LFC_06h = res_06h_shrunk[treatment_universe, "log2FoldChange"],
+  model_LFC_24h = res_24h_shrunk[treatment_universe, "log2FoldChange"]
+) %>%
+  inner_join(gene_clusters_dynamic, by = "gene_id") %>%
+  inner_join(df_membership, by = "gene_id") %>%
+  mutate(is_core = if_else(membership_score > 0.25, "Core (>0.25)", "Borderline (<=0.25)"))
+
+# ==========================================
+# 1. SETUP TWO-TONE GLASBEY COLOR MAP
+# ==========================================
+k_val <- 7
+cutoff <- 0.25
+base_colors <- as.vector(pals::glasbey(k_val))
+
+color_map <- data.frame(
+  cluster = as.factor(1:k_val),
+  base_color = base_colors,
+  light_color = paste0(base_colors, "40") # 25% opacity for background halos
+)
+
+df_plot_master <- df_plot_master %>%
+  inner_join(color_map, by = "cluster") %>%
+  mutate(final_color = if_else(membership_score > cutoff, as.character(base_color), as.character(light_color)))
+
+# ==========================================
+# PLOT 1: ALL ASSIGNED GENES (SHRUNKEN)
+# ==========================================
+p1_static <- ggplot(df_plot_master, aes(
+    x = model_LFC_06h, y = model_LFC_24h, color = cluster,
+    text = paste0("<b>Gene:</b> ", gene_id, "<br><b>Cluster:</b> ", cluster, "<br><b>LFC 06h:</b> ", round(model_LFC_06h, 3), "<br><b>Score:</b> ", round(membership_score, 3))
+  )) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "gray40") +
+  scale_color_manual(values = base_colors) + 
+  theme_minimal(base_size = 11) +
+  labs(title = "Plot 1: All Assigned Genes (Shrunken LFC Space)",
+       x = "Log2 Fold Change at 06h (model_LFC_06h)", y = "Log2 Fold Change at 24h (model_LFC_24h)")
+
+p1_interactive <- ggplotly(p1_static, tooltip = "text") %>% layout(yaxis = list(scaleanchor = "x", scaleratio = 1))
+
+# ==========================================
+# PLOT 2: THE 0.25 CUT ONLY (SHRUNKEN CORE)
+# ==========================================
+df_plot_filtered <- df_plot_master %>% filter(membership_score > cutoff)
+
+p2_static <- ggplot(df_plot_filtered, aes(
+    x = model_LFC_06h, y = model_LFC_24h, color = cluster,
+    text = paste0("<b>Gene:</b> ", gene_id, "<br><b>Cluster:</b> ", cluster, "<br><b>LFC 06h:</b> ", round(model_LFC_06h, 3), "<br><b>Score:</b> ", round(membership_score, 3))
+  )) +
+  geom_point(alpha = 0.8, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "gray40") +
+  scale_color_manual(values = base_colors) + 
+  theme_minimal(base_size = 11) +
+  labs(title = paste("Plot 2: Core Genes Only (Membership >", cutoff, ")"),
+       x = "Log2 Fold Change at 06h (model_LFC_06h)", y = "Log2 Fold Change at 24h (model_LFC_24h)")
+
+p2_interactive <- ggplotly(p2_static, tooltip = "text") %>% layout(yaxis = list(scaleanchor = "x", scaleratio = 1))
+
+# ==========================================
+# PLOT 3: TWO-TONE HIGHLIGHTING (SHRUNKEN)
+# ==========================================
+p3_static <- ggplot(df_plot_master, aes(
+    x = model_LFC_06h, y = model_LFC_24h, 
+    color = final_color,
+    shape = is_core,
+    text = paste0("<b>Gene:</b> ", gene_id, "<br><b>Cluster:</b> ", cluster, "<br><b>Score:</b> ", round(membership_score, 3), "<br><b>Status:</b> ", is_core)
+  )) +
+  geom_point(aes(size = is_core)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "gray40") +
+  
+  scale_color_identity() + 
+  scale_shape_manual(values = c("Core (>0.25)" = 19, "Borderline (<=0.25)" = 16)) +
+  scale_size_manual(values = c("Core (>0.25)" = 1.6, "Borderline (<=0.25)" = 1.0)) +
+  
+  theme_minimal(base_size = 11) +
+  labs(title = "Plot 3: Two-Tone Membership Highlight (Shrunken Space)",
+       x = "Log2 Fold Change at 06h (model_LFC_06h)", y = "Log2 Fold Change at 24h (model_LFC_24h)",
+       shape = "Membership Status")
+
+p3_interactive <- ggplotly(p3_static, tooltip = "text") %>% layout(yaxis = list(scaleanchor = "x", scaleratio = 1))
+```
+highlight core genes
+
+```{r}
+# ==========================================
+# PLOT WITH A MORE LENIENT MEMBERSHIP THRESHOLD
+# ==========================================
+
+# Lowering the cutoff to 0.30 to recover valid trajectories
+df_lenient_profiles <- df_profiles_mem %>% 
+  filter(membership_score > 0.30) 
+
+ggplot(df_lenient_profiles, aes(x = Timepoint, y = LFC, group = gene_id, color = cluster)) +
+  # Alpha mapping automatically handles the fading based on individual score
+  geom_line(aes(alpha = membership_score)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~cluster, labeller = label_both, ncol = 4) +
+  scale_color_manual(values = color_vector) +
+  
+  # Fine-tune the fade: lower values are fainter, higher values are more solid
+  scale_alpha_continuous(range = c(0.08, 0.5)) + 
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "gray95", color = NA),
+    panel.spacing = unit(1, "lines")
+  ) +
+  labs(
+    title = "Exposure Trajectories (Membership > 0.30)",
+    subtitle = "Lenient threshold: Shaded by mathematical fit to archetype",
+    x = "Post-Exposure Timepoint",
+    y = "Log2 Fold Change"
+  )
+```
+
+```{r}
+library(tidyverse)
+
+# ==========================================
+# COMPUTE GENE COUNTS AT DIFFERENT THRESHOLDS
+# ==========================================
+
+# 1. Total genes assigned to each cluster (No threshold)
+count_all <- df_final_plot_with_mem %>%
+  count(cluster, name = "Total_Assigned")
+
+# 2. Count genes with membership > 0.25
+count_25 <- df_final_plot_with_mem %>%
+  filter(membership_score > 0.25) %>%
+  count(cluster, name = "Cut_0.25")
+
+# 3. Count genes with membership > 0.30
+count_30 <- df_final_plot_with_mem %>%
+  filter(membership_score > 0.30) %>%
+  count(cluster, name = "Cut_0.30")
+
+# 4. Count genes with membership > 0.35
+count_35 <- df_final_plot_with_mem %>%
+  filter(membership_score > 0.35) %>%
+  count(cluster, name = "Cut_0.35")
+
+# 5. Count genes with membership > 0.40
+count_40 <- df_final_plot_with_mem %>%
+  filter(membership_score > 0.40) %>%
+  count(cluster, name = "Cut_0.40")
+
+# ==========================================
+# MERGE INTO A DIAGNOSTIC AUDIT TABLE
+# ==========================================
+threshold_audit <- count_all %>%
+  left_join(count_25, by = "cluster") %>%
+  left_join(count_30, by = "cluster") %>%
+  left_join(count_35, by = "cluster") %>%
+  left_join(count_40, by = "cluster") %>%
+  # Replace any NA values with 0 (in case a tight cluster drops completely at high cuts)
+  mutate(across(everything(), ~replace_na(., 0)))
+
+print("--- Cluster Stability Audit Table ---")
+print(threshold_audit)
+```
+
+```{r}
+# Lowering the cutoff to 0.30 to recover valid trajectories
+df_lenient_profiles <- df_profiles_mem %>% 
+  filter(membership_score > 0.25) 
+
+ggplot(df_lenient_profiles, aes(x = Timepoint, y = LFC, group = gene_id, color = cluster)) +
+  # Alpha mapping automatically handles the fading based on individual score
+  geom_line(aes(alpha = membership_score)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~cluster, labeller = label_both, ncol = 4) +
+  scale_color_manual(values = color_vector) +
+  
+  # Fine-tune the fade: lower values are fainter, higher values are more solid
+  scale_alpha_continuous(range = c(0.08, 0.5)) + 
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "gray95", color = NA),
+    panel.spacing = unit(1, "lines")
+  ) +
+  labs(
+    title = "Exposure Trajectories (Membership > 0.25)",
+    subtitle = "Lenient threshold: Shaded by mathematical fit to archetype",
+    x = "Post-Exposure Timepoint",
+    y = "Log2 Fold Change"
+  )
+```
+
+
+
+
+```{r}
+# ==========================================
+# EXTRACT FINAL HIGH-CONFIDENCE GENE LISTS (CUT = 0.25)
+# ==========================================
+
+final_cluster_genes <- df_final_plot_with_mem %>%
+  filter(membership_score > 0.25) %>%
+  select(gene_id, cluster, membership_score, model_LFC_06h, model_LFC_24h)
+
+# Split into an R list for easy downstream pathway analysis
+final_gene_lists <- split(final_cluster_genes$gene_id, final_cluster_genes$cluster)
+
+# Quick check to ensure the counts match our Cut_0.25 column exactly
+print(sapply(final_gene_lists, length))
+```
+
+
+```{r}
+library(tidyverse)
+library(plotly)
+library(pals)
+
+# ==========================================
+# BRIDGE ENVIRONMENT VARIABLES
+# ==========================================
+res_06h_shrunk <- res_LFC_06h
+res_24h_shrunk <- res_LFC_24h
+
+# ==========================================
+# RE-RUN MASTER DATA GENERATION
+# ==========================================
+df_plot_master <- data.frame(
+  gene_id       = treatment_universe,
+  model_LFC_06h = res_06h_shrunk[treatment_universe, "log2FoldChange"],
+  model_LFC_24h = res_24h_shrunk[treatment_universe, "log2FoldChange"]
+) %>%
+  inner_join(gene_clusters_dynamic, by = "gene_id") %>%
+  inner_join(df_membership, by = "gene_id") %>%
+  mutate(is_core = if_else(membership_score > 0.25, "Core (>0.25)", "Borderline (<=0.25)"))
+
+# ==========================================
+# SETUP TWO-TONE GLASBEY COLOR MAP
+# ==========================================
+k_val <- 7
+cutoff <- 0.25
+base_colors <- as.vector(pals::glasbey(k_val))
+
+color_map <- data.frame(
+  cluster = as.factor(1:k_val),
+  base_color = base_colors,
+  light_color = paste0(base_colors, "40") # 25% opacity for background halos
+)
+
+df_plot_master <- df_plot_master %>%
+  inner_join(color_map, by = "cluster") %>%
+  mutate(final_color = if_else(membership_score > cutoff, as.character(base_color), as.character(light_color)))
+
+# ==========================================
+# GENERATE PLOT 3: TWO-TONE HIGHLIGHTING
+# ==========================================
+p3_static <- ggplot(df_plot_master, aes(
+    x = model_LFC_06h, y = model_LFC_24h, 
+    color = final_color,
+    shape = is_core,
+    text = paste0("<b>Gene:</b> ", gene_id, "<br><b>Cluster:</b> ", cluster, "<br><b>Score:</b> ", round(membership_score, 3), "<br><b>Status:</b> ", is_core)
+  )) +
+  geom_point(aes(size = is_core)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "gray40") +
+  
+  scale_color_identity() + 
+  scale_shape_manual(values = c("Core (>0.25)" = 19, "Borderline (<=0.25)" = 16)) +
+  scale_size_manual(values = c("Core (>0.25)" = 1.6, "Borderline (<=0.25)" = 1.0)) +
+  
+  theme_minimal(base_size = 11) +
+  labs(title = "Plot 3: Two-Tone Membership Highlight (Shrunken Space)",
+       x = "Log2 Fold Change at 06h (model_LFC_06h)", y = "Log2 Fold Change at 24h (model_LFC_24h)",
+       shape = "Membership Status")
+
+p3_interactive <- ggplotly(p3_static, tooltip = "text") %>% layout(yaxis = list(scaleanchor = "x", scaleratio = 1))
+
+# View the final two-tone map
+p3_interactive
+```
+
+add a logfc filter to keep gene membership in a cluster if the log2fc is high 
+
+```{r}
+# ==========================================
+# HYBRID CAPTURE: CORE SHAPES + BIOLOGICAL POWERHOUSES
+# ==========================================
+
+df_HYBRID_CLEAN <- df_SHRUNK_FINAL %>%
+  mutate(
+    # A gene is a powerhouse if its absolute LFC is greater than 1.5 at either timepoint
+    is_powerhouse = (abs(model_LFC_06h) > 1.5 | abs(model_LFC_24h) > 1.5),
+    
+    # Final inclusion status: Keep if it passes the shape test OR the magnitude test
+    keep_for_downstream = (membership_score > 0.25 | is_powerhouse)
+  )
+
+# Let's see how many powerhouse genes we just rescued
+rescued_count <- df_HYBRID_CLEAN %>% 
+  filter(membership_score <= 0.25 & is_powerhouse == TRUE) %>% 
+  nrow()
+
+message("Rescued ", rescued_count, " high-magnitude genes that fuzzy clustering penalized!")
+```
+
+```{r}
+library(tidyverse)
+library(plotly)
+library(pals)
+
+# ==========================================
+# 1. CLASSIFY GENES BY HYBRID CRITERIA
+# ==========================================
+df_hybrid_plot <- df_SHRUNK_FINAL %>%
+  mutate(
+    is_powerhouse = (abs(model_LFC_06h) > 1.5 | abs(model_LFC_24h) > 1.5),
+    is_shape_core = (membership_score > 0.25),
+    
+    # Establish the four visual categories
+    hybrid_status = case_when(
+      is_shape_core & is_powerhouse   ~ "Dual Champion (Shape & Magnitude)",
+      !is_shape_core & is_powerhouse  ~ "Powerhouse Rescued (Magnitude Only)",
+      is_shape_core & !is_powerhouse  ~ "Core Trajectory (Shape Only)",
+      TRUE                            ~ "Filtered Out (Fails Both)"
+    )
+  )
+
+# ==========================================
+# 2. DEFINE HIGH-CONTRAST SEPARATION COLORS
+# ==========================================
+# Base colors for the 7 clusters
+k_val <- 7
+base_colors <- as.vector(pals::glasbey(k_val))
+
+# Generate the custom coloring matrix directly in the dataframe
+df_hybrid_plot <- df_hybrid_plot %>%
+  mutate(final_color = case_when(
+    # Filtered out genes turn a uniform, faint light gray
+    hybrid_status == "Filtered Out (Fails Both)" ~ "#E0E0E080",
+    
+    # Rescued powerhouses get the bright, solid cluster color so they stand out
+    hybrid_status == "Powerhouse Rescued (Magnitude Only)" ~ as.character(base_color),
+    
+    # Dual champions get the bright, solid cluster color
+    hybrid_status == "Dual Champion (Shape & Magnitude)" ~ as.character(base_color),
+    
+    # Standard trajectory shape-followers get a slightly softer, cleaner tint
+    hybrid_status == "Core Trajectory (Shape Only)" ~ paste0(base_color, "99")
+  ))
+
+# ==========================================
+# 3. GENERATE THE INTERACTIVE HYBRID PLOT
+# ==========================================
+p4_static <- ggplot(df_hybrid_plot, aes(
+    x = model_LFC_06h, 
+    y = model_LFC_24h, 
+    color = final_color,
+    shape = hybrid_status,
+    text = paste0("<b>Gene:</b> ", gene_id, 
+                  "<br><b>Cluster:</b> ", cluster, 
+                  "<br><b>Score:</b> ", round(membership_score, 3), 
+                  "<br><b>Type:</b> ", hybrid_status)
+  )) +
+  # Draw background filtered points first, then overlay active groups
+  geom_point(aes(size = hybrid_status)) +
+  
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  # Reference gates for the LFC 1.5 thresholds
+  geom_hline(yintercept = c(-1.5, 1.5), linetype = "dotted", color = "gray70") +
+  geom_vline(xintercept = c(-1.5, 1.5), linetype = "dotted", color = "gray70") +
+  
+  scale_color_identity() +
+  scale_shape_manual(values = c(
+    "Dual Champion (Shape & Magnitude)"   = 19, # Solid Circle
+    "Powerhouse Rescued (Magnitude Only)" = 17, # Solid Triangle
+    "Core Trajectory (Shape Only)"        = 16, # Softer Circle
+    "Filtered Out (Fails Both)"           = 4   # Small Cross
+  )) +
+  scale_size_manual(values = c(
+    "Dual Champion (Shape & Magnitude)"   = 1.8,
+    "Powerhouse Rescued (Magnitude Only)" = 2.0, # Slightly bigger to pull focus
+    "Core Trajectory (Shape Only)"        = 1.2,
+    "Filtered Out (Fails Both)"           = 0.8
+  )) +
+  
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Plot 4: Hybrid Strategy Grouping (K = 7)",
+    subtitle = "Triangles highlight the high-magnitude genes rescued by our LFC gate",
+    x = "Log2 Fold Change at 06h (MAP Shrunken)", 
+    y = "Log2 Fold Change at 24h (MAP Shrunken)",
+    shape = "Inclusion Status"
+  )
+
+p4_interactive <- ggplotly(p4_static, tooltip = "text") %>% 
+  layout(yaxis = list(scaleanchor = "x", scaleratio = 1))
+
+# Render the hybrid landscape
+p4_interactive
+```
+
+
+```{r}
+library(tidyverse)
+
+# ==========================================
+# 1. RESTRUCTURE HYBRID DATA FOR TIME PROFILE
+# ==========================================
+df_profiles_hybrid <- df_hybrid_plot %>%
+  select(gene_id, cluster, hybrid_status, model_LFC_06h, model_LFC_24h) %>%
+  pivot_longer(
+    cols = starts_with("model_LFC"),
+    names_to = "Timepoint",
+    values_to = "LFC"
+  ) %>%
+  mutate(Timepoint = factor(Timepoint, 
+                            levels = c("model_LFC_06h", "model_LFC_24h"),
+                            labels = c("06h", "24h")))
+
+# Filter out the genes that failed both thresholds so we only plot active selections
+df_profiles_active <- df_profiles_hybrid %>%
+  filter(hybrid_status != "Filtered Out (Fails Both)") %>%
+  # Create a simpler grouping for line-styling
+  mutate(line_type = if_else(str_detect(hybrid_status, "Powerhouse"), "Rescued Driver", "Core Shape"))
+
+# ==========================================
+# 2. GENERATE UPDATED PROFILE PLOTS
+# ==========================================
+library(tidyverse)
+
+# ==========================================
+# GENERATE HIGH-CONTRAST SELECTIVE PROFILE PLOT
+# ==========================================
+ggplot(df_profiles_active, aes(x = Timepoint, y = LFC, group = gene_id)) +
+  # Baseline 0-change reference line
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  # Magnitude gates (dotted references)
+  geom_hline(yintercept = c(-1.5, 1.5), linetype = "dotted", color = "gray70") +
+  
+  # 1. DRAW BACKGROUND LINES IN SOFT GRAY
+  # This keeps the overall cluster "wave" visible without competing for color
+  geom_line(data = filter(df_profiles_active, line_type == "Core Shape"), 
+            color = "gray80", alpha = 0.2, size = 0.4) +
+  
+  # 2. OVERLAY THE RESCUED POWERHOUSES IN SOLID CLUSTER COLORS
+  # These will slice cleanly through the gray background waves
+  geom_line(data = filter(df_profiles_active, line_type == "Rescued Driver"), 
+            aes(color = cluster), alpha = 0.9, size = 1.2) +
+  
+  # Split cleanly by your 7 biological waves
+  facet_wrap(~cluster, labeller = label_both, ncol = 4) +
+  
+  # Map the solid colors exclusively to the rescued lines
+  scale_color_manual(values = base_colors) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none", # Cluster names are already on the facet headers
+    strip.background = element_rect(fill = "gray95", color = NA),
+    panel.spacing = unit(1.1, "lines"),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Rescued Driver Kinetics Across Clusters",
+    subtitle = "Vibrant lines show high-magnitude drivers (|LFC| > 1.5) slicing through gray cluster backgrounds",
+    x = "Post-Exposure Timepoint",
+    y = "Log2 Fold Change vs Matched Control"
+  )
+```
+
+split out the rescue genes with steeper angles vs the inverse/counter regulation
+
+```{r}
+library(tidyverse)
+
+# ==========================================
+# 1. CALCULATE EXPECTED CLUSTER TRAJECTORIES
+# ==========================================
+# We find the average direction of each cluster at 24h to serve as our compass
+cluster_directions <- df_SHRUNK_FINAL %>%
+  group_by(cluster) %>%
+  summarize(
+    cluster_mean_24h = mean(model_LFC_24h, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# ==========================================
+# 2. BUILD THE FINAL ANNOTATED MASTER DATASET
+# ==========================================
+df_FINAL_ANNOTATED <- df_SHRUNK_FINAL %>%
+  inner_join(cluster_directions, by = "cluster") %>%
+  mutate(
+    # Recalculate basic flags directly to ensure no missing object errors
+    is_powerhouse = (abs(model_LFC_06h) > 1.5 | abs(model_LFC_24h) > 1.5),
+    is_shape_core = (membership_score > 0.25),
+    
+    # Classify the exact behavior of every gene
+    driver_behavior = case_when(
+      # If it passes the fuzzy math threshold, it's a standard core member
+      is_shape_core ~ "Standard Core",
+      
+      # If it failed the fuzzy math but passed our magnitude gate, check its direction:
+      # If its 24h LFC has a different sign than the cluster average, it's an inversion!
+      is_powerhouse & (sign(model_LFC_24h) != sign(cluster_mean_24h)) ~ "Inverse Driver",
+      
+      # If it has the same sign but failed fuzzy math, it's just a hyper-amplified outlier
+      is_powerhouse ~ "Amplified Driver",
+      
+      # Everything else falls below both bars
+      TRUE ~ "Filtered Out"
+    )
+  )
+
+# ==========================================
+# 3. PRINT DIAGNOSTIC BREAKDOWN REPORT & LEDGER
+# ==========================================
+# A. Active Breakdown (Excluding Filtered Out)
+df_active_summary <- df_FINAL_ANNOTATED %>% 
+  filter(driver_behavior != "Filtered Out")
+
+message("--- Final Cleaned Breakdown of Your 7 Waves ---")
+print(table(df_active_summary$cluster, df_active_summary$driver_behavior))
+
+# B. Complete Membership Balance Sheet (Including Filtered Out Columns)
+initial_assignments <- df_FINAL_ANNOTATED %>%
+  count(cluster, name = "Initially_Assigned")
+
+behavior_counts <- df_FINAL_ANNOTATED %>%
+  count(cluster, driver_behavior) %>%
+  pivot_wider(
+    names_from = driver_behavior, 
+    values_from = n, 
+    values_fill = 0
+  )
+
+final_balance_ledger <- initial_assignments %>%
+  inner_join(behavior_counts, by = "cluster") %>%
+  # Explicitly order the columns to trace from Initial -> Core/Drivers -> Filtered Out
+  select(
+    cluster, 
+    Initially_Assigned, 
+    `Standard Core`, 
+    `Amplified Driver`, 
+    `Inverse Driver`, 
+    `Filtered Out`
+  )
+
+message("\n--- Ultimate Cluster Membership Balance Sheet ---")
+print(final_balance_ledger)
+```
+
+
+```{r}
+library(tidyverse)
+library(clusterProfiler)
+
+# ==========================================
+# 1. SETUP KO-SPECIFIC LOOKUPS AND UNIVERSE
+# ==========================================
+# Explicitly loading KO definitions
+ko_codes <- read_tsv("/mnt/work-drive/databases/COG-KEGG-data/KO-definitions.tsv", show_col_types = FALSE)
+
+if ("locus_tag" %in% colnames(anno_operon) && !("Gene" %in% colnames(anno_operon))) {
+  anno_operon_clean <- anno_operon %>% rename(Gene = locus_tag)
+} else {
+  anno_operon_clean <- anno_operon
+}
+
+# Building strict KO term-to-gene mapping table
+ko_TERM2GENE <- anno_operon_clean %>%
+  select(Gene, KO) %>%
+  filter(!is.na(KO), KO != "") %>%
+  separate_rows(KO, sep = ",") %>%
+  mutate(KO = trimws(KO)) %>%
+  select(term = KO, gene = Gene)
+
+ko_TERM2NAME <- ko_codes %>% 
+  transmute(term = KO, name = kDefinition)
+
+ko_enrichment_universe <- as.character(treatment_universe)
+
+# ==========================================
+# 2. RUN STATISTICAL KO PATHWAY ENRICHMENT (POOLED)
+# ==========================================
+ko_combined_enrichment_results <- lapply(1:7, function(i) {
+  pooled_genes <- df_FINAL_ANNOTATED %>%
+    filter(cluster == i, driver_behavior %in% c("Standard Core", "Amplified Driver")) %>%
+    pull(gene_id)
+  
+  res <- enricher(
+    gene          = pooled_genes,
+    universe      = ko_enrichment_universe,
+    pvalueCutoff  = 0.05,
+    pAdjustMethod = "BH",
+    TERM2GENE     = ko_TERM2GENE,
+    TERM2NAME     = ko_TERM2NAME
+  )
+  
+  if (!is.null(res) && nrow(res) > 0) {
+    df <- as.data.frame(res)
+    df$Cluster <- paste0("Cluster_", i)
+    return(df)
+  }
+  return(NULL)
+})
+
+# Final consolidated KO statistical dataframe
+all_ko_enriched_pathways <- bind_rows(ko_combined_enrichment_results)
+
+# ==========================================
+# 3. DIRECT KO FUNCTIONAL TRIAGE FOR OUTLIERS
+# ==========================================
+message("\n=== DIRECT KO ANNOTATION TRIAGE: ALL HIGH-MAGNITUDE OUTLIERS ===")
+
+ko_outlier_manifest <- df_FINAL_ANNOTATED %>%
+  filter(driver_behavior %in% c("Amplified Driver", "Inverse Driver")) %>%
+  select(gene_id, cluster, driver_behavior, model_LFC_06h, model_LFC_24h) %>%
+  left_join(ko_TERM2GENE, by = c("gene_id" = "gene")) %>%
+  left_join(ko_TERM2NAME, by = "term") %>%
+  arrange(cluster, driver_behavior)
+
+# View the curated KO outlier list
+print(ko_outlier_manifest, n = Inf)
+```
+
+```{r}
+library(tidyverse)
+library(clusterProfiler)
+
+# ==========================================
+# 1. PREPARE THE KEGG/KO LOOKUP TABLES
+# ==========================================
+ko_codes <- read_tsv("/mnt/work-drive/databases/COG-KEGG-data/KO-definitions.tsv", show_col_types = FALSE)
+
+# Safety check: Rename locus_tag to Gene if present
+if ("locus_tag" %in% colnames(anno_operon) && !("Gene" %in% colnames(anno_operon))) {
+  anno_operon_clean <- anno_operon %>% rename(Gene = locus_tag)
+} else {
+  anno_operon_clean <- anno_operon
+}
+
+# Split comma separated lists using the standardized column name
+ko_TERM2GENE <- anno_operon_clean %>%
+  select(Gene, KO) %>%
+  filter(!is.na(KO), KO != "") %>%
+  separate_rows(KO, sep = ",") %>%
+  mutate(KO = trimws(KO)) %>%
+  select(term = KO, gene = Gene)
+
+TERM2NAME <- ko_codes %>%
+  transmute(term = KO, name = kDefinition)
+
+# ==========================================
+# 2. DEFINE THE STRICT STRUCTURAL UNIVERSE
+# ==========================================
+enrichment_universe <- as.character(treatment_universe)
+
+# ==========================================
+# 3. GENERATE ACTIVE RE-DIRECTIONED LISTS
+# ==========================================
+hybrid_cluster_lists <- list()
+
+for (i in 1:7) {
+  # Wave i: Positive Responders (Core + Amplified)
+  pos_genes <- df_FINAL_ANNOTATED %>%
+    filter(cluster == i, driver_behavior %in% c("Standard Core", "Amplified Driver")) %>%
+    pull(gene_id)
+  
+  if(length(pos_genes) > 0) {
+    hybrid_cluster_lists[[paste0("Cluster_", i, "_Positive")]] <- pos_genes
+  }
+  
+  # Wave i: Inverse Responders (Counter-regulators)
+  inv_genes <- df_FINAL_ANNOTATED %>%
+    filter(cluster == i, driver_behavior == "Inverse Driver") %>%
+    pull(gene_id)
+  
+  if(length(inv_genes) > 0) {
+    hybrid_cluster_lists[[paste0("Cluster_", i, "_Inverse")]] <- inv_genes
+  }
+}
+
+# ==========================================
+# 4. RUN HYBRID PATHWAY ENRICHMENT
+# ==========================================
+ko_hybrid_enrichment_results <- lapply(names(hybrid_cluster_lists), function(list_name) {
+  genes_to_test <- hybrid_cluster_lists[[list_name]]
+  
+  res <- enricher(
+    gene          = genes_to_test,
+    universe      = enrichment_universe,
+    pvalueCutoff  = 0.05,
+    pAdjustMethod = "BH",
+    TERM2GENE     = ko_TERM2GENE,
+    TERM2NAME     = TERM2NAME
+  )
+  
+  if (!is.null(res) && nrow(res) > 0) {
+    df <- as.data.frame(res)
+    df$Analysis_Group <- list_name
+    return(df)
+  }
+  return(NULL)
+})
+
+# ==========================================
+# 5. CONSOLIDATE AND INSPECT
+# ==========================================
+all_ko_enriched_hybrid <- bind_rows(ko_hybrid_enrichment_results)
+
+head(all_ko_enriched_hybrid)
+```
+
+
+
+
+
+
+
+```{r}
+library(tidyverse)
+library(clusterProfiler)
+
+# ==========================================
+# RUN PARALLEL ENRICHMENT (CORES VS. POWERHOUSES)
+# ==========================================
+
+# Initialize a clean list to hold all test groups
+ko_test_lists <- list()
+
+for (i in 1:7) {
+  # Track 1: Clean Wave (Core + Amplified) -> High statistical power
+  wave_genes <- df_FINAL_ANNOTATED %>%
+    filter(cluster == i, driver_behavior %in% c("Standard Core", "Amplified Driver")) %>%
+    pull(gene_id)
+  
+  if(length(wave_genes) >= 15) {
+    ko_test_lists[[paste0("Cluster_", i, "_Main_Wave")]] <- wave_genes
+  }
+  
+  # Track 2: Absolute Outliers (Amplified + Inverse) -> Captures extreme biology
+  outlier_genes <- df_FINAL_ANNOTATED %>%
+    filter(cluster == i, driver_behavior %in% c("Amplified Driver", "Inverse Driver")) %>%
+    pull(gene_id)
+  
+  # Give it a lower, safer size threshold since outliers are naturally rare
+  if(length(outlier_genes) >= 3) {
+    ko_test_lists[[paste0("Cluster_", i, "_Extreme_Outliers")]] <- outlier_genes
+  }
+}
+
+# Run the enrichment loop across all generated groups
+ko_parallel_results <- lapply(names(ko_test_lists), function(group_name) {
+  res <- enricher(
+    gene          = ko_test_lists[[group_name]],
+    universe      = ko_enrichment_universe,
+    pvalueCutoff  = 0.05,
+    pAdjustMethod = "BH",
+    TERM2GENE     = ko_TERM2GENE,
+    TERM2NAME     = ko_TERM2NAME
+  )
+  
+  if (!is.null(res) && nrow(res) > 0) {
+    df <- as.data.frame(res)
+    df$Analysis_Group <- group_name
+    return(df)
+  }
+  return(NULL)
+})
+
+# Combine all parallel tracks into your final results table
+all_ko_enriched_pathways <- bind_rows(ko_parallel_results)
+
+# Inspect the results to confirm your missing term has returned
+filter(all_ko_enriched_pathways, str_detect(Analysis_Group, "Cluster_3")) %>% head()
+```
+
+```{r}
+library(tidyverse)
+
+# ==========================================
+# GENERATE STANDALONE OUTLIER FUNCTIONAL MANIFEST
+# ==========================================
+
+df_outlier_functional_manifest <- df_FINAL_ANNOTATED %>%
+  # Filter strictly for the standalone, high-magnitude categories
+  filter(driver_behavior %in% c("Amplified Driver", "Inverse Driver")) %>%
+  
+  # Select key identification and kinetic columns
+  select(
+    gene_id, 
+    cluster, 
+    driver_behavior, 
+    model_LFC_06h, 
+    model_LFC_24h
+  ) %>%
+  
+  # Map to every associated KO term (explodes comma-separated genes into rows)
+  left_join(ko_TERM2GENE, by = c("gene_id" = "gene")) %>%
+  
+  # Map KO terms to their human-readable definitions
+  left_join(ko_TERM2NAME, by = "term") %>%
+  
+  # Organize logically by cluster and behavior
+  arrange(cluster, driver_behavior, gene_id)
+
+# ==========================================
+# EXPORT AND PREVIEW
+# ==========================================
+# Save as a clean CSV for Excel/supplementary data sharing
+write_csv(df_outlier_functional_manifest, "/mnt/work-drive/kira/deseq2New/final-split/standalone_outliers_ko_manifest.csv")
+
+message("SUCCESS: Standalone manifest with expanded KO terms exported to '/mnt/work-drive/kira/deseq2New/final-split/standalone_outliers_ko_manifest.csv'")
+
+# Preview the top of your standalone manifest
+head(df_outlier_functional_manifest, n = 15)
+```
+
