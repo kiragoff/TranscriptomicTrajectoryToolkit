@@ -6,5 +6,7 @@
 # ignore raw data and script outputs
 kallisto/
 results/
+lookups/
 meta.csv
 peri-anno-definitions.tsv
+03_cluster_analysis-full.Rmd
