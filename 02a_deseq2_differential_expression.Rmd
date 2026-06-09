@@ -143,10 +143,6 @@ plotPCA(vsd_full)
 plotDispEsts(dds_full)
 ```
 
-```{r disp-est-vst-full}
-plotDispEsts(vsd_full)
-```
-
 ```{r}
 sample_dists <- dist(t(assay(vsd_full)))
 
@@ -335,8 +331,8 @@ subhead <- "Contrast - Exposure"
 save <- sprintf("volcano-%s-qval_%g-lfc_%g.png", contrast_name, alpha, lfc_cutoff)
 
 ev <- EnhancedVolcano(
-  contrast_df,
-  lab = rep("", nrow(contrast_df)),
+  contrast_set,
+  lab = rep("", nrow(contrast_set)),
   x = "log2FoldChange",
   y = "padj",
   pCutoff = alpha,
@@ -508,8 +504,8 @@ headline <- "06h Control:Exposure"
 save <- sprintf("volcano-%s-qval_%g-lfc_%g.png", contrast_name, alpha, lfc_cutoff)
 
 ev <- EnhancedVolcano(
-  contrast_df,
-  lab = rep("", nrow(contrast_df)),
+  contrast_set,
+  lab = rep("", nrow(contrast_set)),
   x = "log2FoldChange",
   y = "padj",
   pCutoff = alpha,
@@ -593,8 +589,8 @@ headline <- "24h Control:Exposure"
 save <- sprintf("volcano-%s-qval_%g-lfc_%g.png", contrast_name, alpha, lfc_cutoff)
 
 ev <- EnhancedVolcano(
-  contrast_df,
-  lab = rep("", nrow(contrast_df)),
+  contrast_set,
+  lab = rep("", nrow(contrast_set)),
   x = "log2FoldChange",
   y = "padj",
   pCutoff = alpha,
