@@ -1,0 +1,474 @@
+---
+title: "04a_cluster_enrichment_automated"
+author: "Kira Goff"
+date: "2026-06-11"
+output: html_document
+---
+
+```{r}
+# Core Data Science & Wrangling
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(forcats)
+
+# Genomics & Bioinformatics
+library(DESeq2)
+library(Mfuzz)
+library(clusterProfiler)
+
+# Clustering & Math/Stats
+library(cluster)
+library(e1071)
+
+# Visualization & Color Palettes
+library(pals)
+library(plotly)
+library(ggplot2)
+library(enrichplot)
+library(pheatmap)
+library(grid)
+
+# Web & API Tools
+library(httr)
+library(jsonlite)
+```
+
+```{r}
+base_dir <- "./"
+base_results <- "./results"
+main_results_dir <- "./results/04-cluster-enrichment-auto"
+lookup_dir <- "./lookups"
+
+if (!dir.exists(main_results_dir)) {
+  dir.create(main_results_dir, recursive = TRUE)
+}
+
+if ("locus_tag" %in% colnames(anno_operon) && !("Gene" %in% colnames(anno_operon))) {
+  anno_operon_clean <- anno_operon %>% rename(Gene = locus_tag)
+} else {
+  anno_operon_clean <- anno_operon
+}
+```
+
+```{r}
+db_configs <- list(
+  KO = list(
+    db_label = "KO",
+    database_tsv_path = file.path(lookup_dir, "KO-definitions.tsv"),
+    db_term_col = "KO",
+    db_definition_col = "kDefinition"
+  ),
+  kPathway = list(
+    db_label = "KEGG_Pathway",
+    database_tsv_path = file.path(lookup_dir, "kegg-pathwaymaps.tsv"),
+    db_term_col = "pathway",
+    db_definition_col = "kPathDef"
+  ),
+  kModule = list(
+    db_label = "KEGG_Module",
+    database_tsv_path = file.path(lookup_dir, "kegg-modules.tsv"),
+    db_term_col = "module",
+    db_definition_col = "kModDef"
+  ),
+  kRxn = list(
+    db_label = "KEGG_Reaction",
+    database_tsv_path = file.path(lookup_dir, "kegg-reactions.tsv"),
+    db_term_col = "reaction",
+    db_definition_col = "kReactionDef"
+  ),
+  COG = list(
+    db_label = "COG",
+    database_tsv_path = file.path(lookup_dir, "cog-def.tsv"),
+    db_term_col = "COG",
+    db_definition_col = "cDef"
+  ),
+  COGcat = list(
+    db_label = "COG_cat",
+    database_tsv_path = file.path(lookup_dir, "cog_codes.tsv"),
+    db_term_col = "COG_code",
+    db_definition_col = "cCodeDef"
+  )
+)
+```
+
+```{r}
+# ----- Global Threshold & Metadata Definitions -----
+qtable <- 0.3         # q threshold for out table
+ptable <- 0.1         # p threshold for out table
+clust_thresh <- 0.25  # Baseline cluster membership threshold
+lfc_rescue <- 1       # Log2 Fold Change fallback rescue threshold
+
+# Keywords to filter out
+housekeeping_terms <- c(
+  "\\b5s\\b", "\\b16s\\b", "\\b23s\\b", 
+  "rrna", 
+  "ribosomal protein", 
+  "^ribosomal large subunit$", 
+  "^ribosomal small subunit$",
+  "sigma factor", "rna polymerase"
+)
+
+# Detectable background from DESeq2
+raw_universe_genes <- rownames(dds)
+
+# ==============================================================================
+# BEGIN MASTER LOOP OVER ALL DATABASES
+# ==============================================================================
+for (target_db in names(db_configs)) {
+  
+  message("====================================================================")
+  message(sprintf(" PROCESSING DATABASE: %s ", target_db))
+  message("====================================================================")
+  
+  # --- Clear previous iteration variables to safeguard downstream logic ---
+  if (exists("final_enrichment_df")) rm(final_enrichment_df)
+  if (exists("matrix_wide_df")) rm(matrix_wide_df)
+  
+  # Extract specific DB variables
+  db_label          <- db_configs[[target_db]]$db_label
+  database_tsv_path <- db_configs[[target_db]]$database_tsv_path
+  db_term_col       <- db_configs[[target_db]]$db_term_col
+  db_definition_col <- db_configs[[target_db]]$db_definition_col
+  
+  # --- Establish Dynamic Output Paths ---
+  results_dir   <- file.path(main_results_dir, db_label)
+  subfolder_dir <- file.path(results_dir, "reshaped_outputs")
+  
+  if (!dir.exists(results_dir))   dir.create(results_dir, recursive = TRUE)
+  if (!dir.exists(subfolder_dir)) dir.create(subfolder_dir, recursive = TRUE)
+  
+  # Load term definitions safely
+  if (!file.exists(database_tsv_path)) {
+    warning(sprintf("Metadata TSV missing for %s at: %s. Skipping.", target_db, database_tsv_path))
+    next
+  }
+  
+  clean_defs <- read.delim(database_tsv_path, sep = "\t", stringsAsFactors = FALSE) %>%
+    select(ID = !!sym(db_term_col), Description = !!sym(db_definition_col)) %>%
+    distinct()
+  
+  # --- Map and Split Universe ---
+  t2g_base <- anno_operon_clean %>%
+    filter(Gene %in% raw_universe_genes) %>%
+    select(!!sym(db_label), Gene) %>%
+    drop_na(!!sym(db_label))
+  
+  if (db_label == "COG_cat") {
+    t2g_split <- t2g_base %>%
+      mutate(!!sym(db_label) := gsub("[ ,]", "", !!sym(db_label))) %>%
+      separate_rows(!!sym(db_label), sep = "")
+  } else {
+    t2g_split <- t2g_base %>%
+      separate_rows(!!sym(db_label), sep = ",\\s*")
+    
+    if (target_db == "kPathway") {
+      t2g_split <- t2g_split %>% filter(grepl("^map\\d+", !!sym(db_label)))
+    }
+  }
+  
+  t2g <- t2g_split %>%
+    rename(ID = !!sym(db_label)) %>%
+    left_join(clean_defs, by = "ID") %>%
+    filter(!grepl(paste(housekeeping_terms, collapse = "|"), Description, ignore.case = TRUE)) %>%
+    select(term_id = ID, gene_id = Gene) %>%
+    filter(term_id != "" & term_id != "NA") %>%
+    distinct()
+  
+  universe_vector <- unique(t2g$gene_id)
+  
+  # --- Cluster Setup ---
+  cluster_input <- df_final_clusters %>%
+    filter(is_driver == "High-Confidence") %>% 
+    filter(Gene %in% universe_vector) %>%
+    select(Gene, cluster)
+  
+  if (nrow(cluster_input) == 0) {
+    message(sprintf("No cluster genes overlapped the universe for %s. Skipping analysis.", db_label))
+    next
+  }
+  
+  n_clusters <- length(unique(cluster_input$cluster))
+  all_clusters <- sort(unique(cluster_input$cluster))
+  enrichment_results_list <- list()
+  
+  # --- Run Enrichment Run ---
+  for (clust_id in all_clusters) {
+    current_cluster_genes <- cluster_input %>%
+      filter(cluster == clust_id) %>%
+      pull(Gene)
+    
+    if (length(intersect(current_cluster_genes, universe_vector)) > 0) {
+      ego <- enricher(
+        gene         = current_cluster_genes,
+        universe     = universe_vector,
+        TERM2GENE    = t2g,
+        pvalueCutoff = ptable,
+        qvalueCutoff = qtable,
+        minGSSize    = 2,
+        maxGSSize    = 500
+      )
+      
+      if (!is.null(ego) && nrow(ego@result) > 0) {
+        res_df <- as.data.frame(ego) %>%
+          mutate(Analysis_Group = paste0("Cluster_", clust_id))
+        enrichment_results_list[[as.character(clust_id)]] <- res_df
+      }
+    }
+  }
+  
+  # ==============================================================================
+  # DATA EXPORT & SAVING
+  # ==============================================================================
+  if (length(enrichment_results_list) > 0) {
+    final_enrichment_df <- bind_rows(enrichment_results_list) %>%
+      select(-any_of("Description")) %>%
+      left_join(clean_defs, by = "ID") %>%
+      select(Analysis_Group, ID, Description, Count, everything())
+    
+    # Standard Dynamic Base Name Rule
+    base_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d", db_label, clust_thresh, lfc_rescue, n_clusters)
+    
+    # 1. Main Table (By Enrichment Term)
+    original_out_path <- file.path(results_dir, paste0(base_name, ".tsv"))
+    write.table(final_enrichment_df, original_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+    
+    # 2. Tidy Long Format (By Gene)
+    tidy_long_df <- final_enrichment_df %>%
+      separate_rows(geneID, sep = "/") %>%
+      rename(Gene_ID = geneID) %>%
+      select(Analysis_Group, Gene_ID, ID, Description, everything()) %>%
+      arrange(Analysis_Group, Gene_ID, p.adjust)
+    
+    long_out_path <- file.path(subfolder_dir, paste0(base_name, "_long_by_gene.tsv"))
+    write.table(tidy_long_df, long_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+    
+    # 3. Wide Binary Matrix
+    matrix_wide_df <- final_enrichment_df %>%
+      mutate(Enriched = 1) %>%
+      select(ID, Description, Analysis_Group, Enriched) %>%
+      distinct() %>%
+      pivot_wider(names_from = Analysis_Group, values_from = Enriched, values_fill = 0) %>%
+      arrange(ID)
+    
+    wide_out_path <- file.path(subfolder_dir, paste0(base_name, "_cluster_profile_matrix.tsv"))
+    write.table(matrix_wide_df, wide_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+    
+    message("Success! Exported three data file variations.")
+    
+# ==============================================================================
+    # VISUALIZATION CALCULATIONS (ALL OUTPUT FORMATS CONVERTED TO PNG)
+    # ==============================================================================
+    
+    # ------------------ Plot 1: Basic Dotplot (PNG) ------------------
+    max_terms <- 50
+    plot_data <- final_enrichment_df %>%
+      group_by(Analysis_Group) %>%
+      slice_min(order_by = p.adjust, n = 15, with_ties = FALSE) %>%
+      ungroup() %>%
+      distinct(ID, Description, Analysis_Group, p.adjust, Count) %>%
+      mutate(Term_Label = sprintf("%s: %s", ID, substr(Description, 1, 50))) %>%
+      mutate(Term_Label = fct_reorder(Term_Label, p.adjust, .desc = TRUE))
+    
+    if (nrow(plot_data) > max_terms) {
+      top_terms <- plot_data %>%
+        group_by(Term_Label) %>%
+        summarise(min_p = min(p.adjust)) %>%
+        slice_min(order_by = min_p, n = max_terms, with_ties = FALSE) %>%
+        pull(Term_Label)
+      
+      plot_data <- plot_data %>% filter(Term_Label %in% top_terms)
+    }
+    
+    enrich_plot <- ggplot(plot_data, aes(x = Analysis_Group, y = Term_Label)) +
+      geom_point(aes(size = Count, color = -log10(p.adjust))) +
+      scale_color_viridis_c(name = "-log10(p.adjust)", option = "magma", direction = 1) +
+      scale_size_continuous(name = "Gene Count", range = c(3, 8)) +
+      theme_bw(base_size = 11) +
+      labs(
+        title = sprintf("Functional Enrichment Profile (%s)", target_db),
+        subtitle = "Top enriched terms mapped across analysis groups",
+        x = "Analysis Cluster", y = "Enriched Functional Term"
+      ) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+        axis.text.y = element_text(size = 9),
+        panel.grid.major = element_line(color = "gray95"),
+        plot.title = element_text(face = "bold", size = 14)
+      )
+    
+    plot_out_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_dotplot.png", db_label, clust_thresh, lfc_rescue, n_clusters)
+    plot_out_path <- file.path(results_dir, plot_out_name)
+    dynamic_height <- max(5, length(unique(plot_data$Term_Label)) * 0.25)
+    
+    ggsave(filename = plot_out_path, plot = enrich_plot, width = 9, height = dynamic_height, dpi = 300, bg = "white")
+    print(enrich_plot)
+    
+    # ------------------ Plot 2: Hierarchical Dotplot (PNG) ------------------
+    matrix_prep <- final_enrichment_df %>%
+      mutate(Signal = -log10(p.adjust)) %>%
+      mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+      select(Row_Label, Analysis_Group, Signal) %>%
+      distinct() %>%
+      pivot_wider(names_from = Analysis_Group, values_from = Signal, values_fill = 0)
+    
+    if (nrow(matrix_prep) > 50) {
+      row_vars <- apply(as.matrix(matrix_prep[, -1]), 1, var)
+      matrix_prep <- matrix_prep[order(-row_vars)[1:50], ]
+    }
+    
+    clust_matrix <- as.matrix(matrix_prep[, -1])
+    rownames(clust_matrix) <- matrix_prep$Row_Label
+    
+    if (nrow(clust_matrix) > 1) {
+      row_hc <- hclust(dist(clust_matrix, method = "euclidean"), method = "complete")
+      ordered_pathways <- rownames(clust_matrix)[row_hc$order]
+    } else {
+      ordered_pathways <- rownames(clust_matrix)
+    }
+    
+    if (ncol(clust_matrix) > 1) {
+      col_hc <- hclust(dist(t(clust_matrix), method = "euclidean"), method = "complete")
+      ordered_clusters <- colnames(clust_matrix)[col_hc$order]
+    } else {
+      ordered_clusters <- colnames(clust_matrix)
+    }
+    
+    plot_data_clustered <- final_enrichment_df %>%
+      mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+      filter(Row_Label %in% ordered_pathways) %>%
+      mutate(
+        Analysis_Group = factor(Analysis_Group, levels = ordered_clusters),
+        Row_Label      = factor(Row_Label, levels = ordered_pathways)
+      )
+    
+    hier_dotplot <- ggplot(plot_data_clustered, aes(x = Analysis_Group, y = Row_Label)) +
+      geom_point(aes(size = Count, color = -log10(p.adjust))) +
+      scale_color_viridis_c(name = "-log10(p.adjust)", option = "magma", direction = 1) +
+      scale_size_continuous(name = "Gene Count", range = c(3, 8)) +
+      theme_bw(base_size = 11) +
+      labs(
+        title = sprintf("Hierarchical Dot Plot Profile (%s)", target_db),
+        subtitle = "Axes arranged dynamically by profile pattern similarity",
+        x = "Analysis Clusters (Clustered)", y = "Enriched Functional Terms (Clustered)"
+      ) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+        axis.text.y = element_text(size = 9),
+        panel.grid.major = element_line(color = "gray95"),
+        plot.title = element_text(face = "bold", size = 14)
+      )
+    
+    dot_out_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_hierarchical_dotplot.png", db_label, clust_thresh, lfc_rescue, n_clusters)
+    dot_out_path <- file.path(results_dir, dot_out_name)
+    dynamic_height_hier <- max(5, length(ordered_pathways) * 0.22)
+    
+    ggsave(filename = dot_out_path, plot = hier_dotplot, width = 9, height = dynamic_height_hier, dpi = 300, bg = "white")
+    print(hier_dotplot)
+    
+    # ------------------ Plot 3: Presence/Absence Main Heatmap (PNG) ------------------
+    heatmap_matrix <- matrix_wide_df %>%
+      mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+      select(-ID, -Description) %>%
+      distinct(Row_Label, .keep_all = TRUE) %>%
+      tibble::column_to_rownames("Row_Label") %>%
+      as.matrix()
+    
+    heatmap_matrix <- heatmap_matrix[rowSums(heatmap_matrix) > 0, , drop = FALSE]
+    
+    if (nrow(heatmap_matrix) > 60) {
+      term_variance <- rowSums(heatmap_matrix)
+      heatmap_matrix <- heatmap_matrix[order(-term_variance)[1:60], , drop = FALSE]
+    }
+    
+    pa_heatmap_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_presence_absence_heatmap.png", db_label, clust_thresh, lfc_rescue, n_clusters)
+    pa_heatmap_path <- file.path(results_dir, pa_heatmap_name)
+    dynamic_height_pa <- max(6, nrow(heatmap_matrix) * 0.22)
+    
+    cluster_rows_flag <- nrow(heatmap_matrix) > 1
+    cluster_cols_flag <- ncol(heatmap_matrix) > 1
+    
+    # Open graphics device stream to catch the S4 object safely without using $gtable
+    png(filename = pa_heatmap_path, width = 8, height = dynamic_height_pa, units = "in", res = 300, bg = "white")
+    pheatmap(
+      mat = heatmap_matrix,
+      color = c("#f0f0f0", "#2b8cbe"),
+      legend_breaks = c(0, 1),
+      legend_labels = c("Not Enriched", "Enriched"),
+      cluster_rows = cluster_rows_flag,
+      cluster_cols = cluster_cols_flag,
+      clustering_distance_rows = "binary",
+      clustering_distance_cols = "binary",
+      clustering_method = "complete",
+      border_color = "white",
+      fontsize_row = 8,
+      fontsize_col = 10,
+      main = sprintf("Hierarchical Profiles: %s Enrichment", target_db)
+    )
+    dev.off()
+    
+    # ------------------ Plot 4: Legacy Profile Heatmap (PNG) ------------------
+    pa_legacy_name <- sprintf("enrichment_heatmap_%s_m%.2f.png", db_label, clust_thresh)
+    pa_legacy_path <- file.path(subfolder_dir, pa_legacy_name)
+    
+    png(filename = pa_legacy_path, width = 8, height = dynamic_height_pa, units = "in", res = 300, bg = "white")
+    pheatmap(
+      mat = heatmap_matrix,
+      color = c("#f0f0f0", "#2b8cbe"),
+      legend_breaks = c(0, 1),
+      legend_labels = c("Not Enriched", "Enriched"),
+      cluster_rows = cluster_rows_flag,
+      cluster_cols = cluster_cols_flag,
+      clustering_distance_rows = "binary",
+      clustering_distance_cols = "binary",
+      clustering_method = "complete",
+      border_color = "white",
+      fontsize_row = 8,
+      fontsize_col = 10,
+      main = sprintf("Hierarchical Profiles: %s Enrichment", target_db)
+    )
+    dev.off()
+    
+    # ------------------ Plot 5: Continuous Dynamic Range Heatmap (PNG) ------------------
+    continuous_matrix <- final_enrichment_df %>%
+      mutate(Signal_Strength = -log10(p.adjust)) %>%
+      mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+      select(Row_Label, Analysis_Group, Signal_Strength) %>%
+      distinct() %>%
+      pivot_wider(names_from = Analysis_Group, values_from = Signal_Strength, values_fill = 0) %>%
+      tibble::column_to_rownames("Row_Label") %>%
+      as.matrix()
+    
+    if (nrow(continuous_matrix) > 50) {
+      row_variances <- apply(continuous_matrix, 1, var)
+      continuous_matrix <- continuous_matrix[order(-row_variances)[1:50], , drop = FALSE]
+    }
+    
+    cont_heatmap_name <- sprintf("enrichment_continuous_heatmap_%s_m%.2f.png", db_label, clust_thresh)
+    cont_heatmap_path <- file.path(subfolder_dir, cont_heatmap_name)
+    dynamic_height_cont <- max(6, nrow(continuous_matrix) * 0.22)
+    
+    cluster_rows_cont <- nrow(continuous_matrix) > 1
+    cluster_cols_cont <- ncol(continuous_matrix) > 1
+    
+    png(filename = cont_heatmap_path, width = 8, height = dynamic_height_cont, units = "in", res = 300, bg = "white")
+    pheatmap(
+      mat = continuous_matrix,
+      color = colorRampPalette(c("#f0f0f0", "#fe9929", "#800026"))(50),
+      cluster_rows = cluster_rows_cont,
+      cluster_cols = cluster_cols_cont,
+      clustering_distance_rows = "euclidean",
+      clustering_distance_cols = "euclidean",
+      clustering_method = "complete",
+      border_color = "white",
+      fontsize_row = 8,
+      fontsize_col = 10,
+      main = sprintf("Clustered Enrichment Intensity [-log10(p.adj)]: %s", target_db)
+    )
+    dev.off()
+  } else {
+    message(sprintf("No valid enrichments passed p/q filtering criteria for %s.", db_label))
+  }
+}
+```
+

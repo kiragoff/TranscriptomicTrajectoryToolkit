@@ -590,7 +590,7 @@ if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
   message("Skipping Heatmap: Wide profile matrix data is missing or empty.") # oopsie daisie message
 }
 ```
-
+TODO: continue fixing from here
 ```{r hierarchical-heatmap-presence-absense, fig.width=7, fig.height=9}
 if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
   # ----- filter and prepare data -----
@@ -624,7 +624,7 @@ if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
   # can also use the pass to ggsave method 
   pdf(file = heatmap_out_path, width = 8, height = max(6, nrow(heatmap_matrix) * 0.22))
 
-  pheatmap(
+pheat<-  pheatmap(
     mat = heatmap_matrix,
     color = c("#f0f0f0", "#2b8cbe"), # Light gray for 0 (Absence), Deep blue for 1 (Enriched)
     legend_breaks = c(0, 1),
@@ -646,6 +646,7 @@ if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
 } else {
   message("Skipping Heatmap: Wide profile matrix data is missing or empty.") # oopsie daisie message
 }
+print(pheat)
 ```
 
 ```{r clustered-heatmap-continuous, fig.width=8, fig.height=10}
@@ -686,7 +687,7 @@ if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
   # 4. Generate the plot
   pdf(file = heatmap_continuous_path, width = 8, height = max(6, nrow(continuous_matrix) * 0.22))
 
-  pheatmap(
+p_cont<-  pheatmap(
     mat = continuous_matrix,
     # Using a continuous color gradient (Light gray -> Orange -> Deep Purple)
     color = colorRampPalette(c("#f0f0f0", "#fe9929", "#800026"))(50),
@@ -707,4 +708,5 @@ if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
 } else {
   message("Skipping Continuous Heatmap: No data available.") # oopsie daisie message
 }
+print(p_cont)
 ```

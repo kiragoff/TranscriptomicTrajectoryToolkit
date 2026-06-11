@@ -39,7 +39,15 @@ library(patchwork)      # Combines multiple plots into grids (Tree-Heatmap layou
 
 
 ```{r}
-results_dir <- "/mnt/work-drive/kira/deseq2New/final-split"
+base_dir <- "./"
+base_results <- "./results"
+results_dir <- "./results/04-cluster-enrichment/go"
+
+
+ifelse(!dir.exists(file.path(results_dir)),
+  dir.create(file.path(results_dir)),
+  "Directory Exists"
+)
 ```
 
 
