@@ -72,37 +72,37 @@ Define databases based on the information in your annotations and structure of y
 db_configs <- list(
   KO = list(
     db_label = "KO",
-    database_tsv_path = file.path(lookup_dir,"KO-definitions.tsv"),
+    database_tsv_path = file.path(lookup_dir, "KO-definitions.tsv"),
     db_term_col = "KO",
     db_definition_col = "kDefinition"
   ),
   kPathway = list(
     db_label = "KEGG_Pathway",
-    database_tsv_path = file.path(lookup_dir,"kegg-pathwaymaps.tsv"),
+    database_tsv_path = file.path(lookup_dir, "kegg-pathwaymaps.tsv"),
     db_term_col = "pathway",
     db_definition_col = "kPathDef"
   ),
   kModule = list(
     db_label = "KEGG_Module",
-    database_tsv_path = file.path(lookup_dir,"kegg-modules.tsv"),
+    database_tsv_path = file.path(lookup_dir, "kegg-modules.tsv"),
     db_term_col = "module",
     db_definition_col = "kModDef"
   ),
   kRxn = list(
     db_label = "KEGG_Reaction",
-    database_tsv_path = file.path(lookup_dir,"kegg-reactions.tsv"),
+    database_tsv_path = file.path(lookup_dir, "kegg-reactions.tsv"),
     db_term_col = "reaction",
     db_definition_col = "kReactionDef"
   ),
   COG = list(
     db_label = "COG",
-    database_tsv_path = file.path(lookup_dir,"cog-def.tsv"),
+    database_tsv_path = file.path(lookup_dir, "cog-def.tsv"),
     db_term_col = "COG",
     db_definition_col = "cDef"
   ),
   COGcat = list(
     db_label = "COG_cat",
-    database_tsv_path = file.path(lookup_dir,"cog_codes.tsv"),
+    database_tsv_path = file.path(lookup_dir, "cog_codes.tsv"),
     db_term_col = "COG_code",
     db_definition_col = "cCodeDef"
   )
@@ -119,12 +119,12 @@ This saves the data in three ways: by enrichment term, by gene, and as a +/- mat
 target_db <- "kRxn" # Options: "KO", "kPathway", "kModule", "kRxn", "COG", "COGcat"
 
 # Threshold variables for output table
-qtable <- 0.3       # q threshold for out table
-ptable <- 0.1       # p threshold for out table
+qtable <- 0.3 # q threshold for out table
+ptable <- 0.1 # p threshold for out table
 
 # --- Threshold Metadata (Updated to match your dual-filtering rules) ---
 clust_thresh <- 0.25 # Baseline cluster membership threshold
-lfc_rescue   <- 1  # Log2 Fold Change fallback rescue threshold
+lfc_rescue <- 1 # Log2 Fold Change fallback rescue threshold
 
 # subfolder for reshaped outputs
 subfolder_dir <- file.path(results_dir, "reshaped_outputs")
@@ -132,12 +132,12 @@ if (!dir.exists(subfolder_dir)) dir.create(subfolder_dir, recursive = TRUE)
 
 # keywords to filter out
 housekeeping_terms <- c(
-  "\\b5s\\b", "\\b16s\\b", "\\b23s\\b",        # Structural RNAs (exact word match)
-  "rrna",     # Pure structural/transport RNAs
-  "ribosomal protein",                         # Catch the structural proteins only
-  "^ribosomal large subunit$",                 # Strips if it's JUST the structural label
+  "\\b5s\\b", "\\b16s\\b", "\\b23s\\b", # Structural RNAs (exact word match)
+  "rrna", # Pure structural/transport RNAs
+  "ribosomal protein", # Catch the structural proteins only
+  "^ribosomal large subunit$", # Strips if it's JUST the structural label
   "^ribosomal small subunit$",
-  "sigma factor", "rna polymerase"             # Transcription core
+  "sigma factor", "rna polymerase" # Transcription core
 )
 
 # Dynamically assign the four variables based on your target selection
@@ -473,8 +473,8 @@ if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
     term_variance <- rowSums(heatmap_matrix)
     heatmap_matrix <- heatmap_matrix[order(-term_variance)[1:60], , drop = FALSE]
   }
-# ----- 4. Draw and Save the Clustered Heatmap via ggsave -----
-  
+  # ----- 4. Draw and Save the Clustered Heatmap via ggsave -----
+
   # Update your file name to .png
   heatmap_out_name <- sprintf("enrichment_heatmap_%s_m%.2f.png", db_label, clust_thresh)
   heatmap_out_path <- file.path(results_dir, "reshaped_outputs", heatmap_out_name)
@@ -482,12 +482,12 @@ if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
   # CRITICAL: Run pheatmap with silent = TRUE and capture the $gtable
   heatmap_grob <- pheatmap(
     mat = heatmap_matrix,
-    color = c("#f0f0f0", "#2b8cbe"), 
+    color = c("#f0f0f0", "#2b8cbe"),
     legend_breaks = c(0, 1),
     legend_labels = c("Not Enriched", "Enriched"),
-    cluster_rows = TRUE, 
-    cluster_cols = TRUE, 
-    clustering_distance_rows = "binary", 
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    clustering_distance_rows = "binary",
     clustering_distance_cols = "binary",
     clustering_method = "complete",
     border_color = "white",
@@ -506,7 +506,7 @@ if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
     plot = heatmap_grob, # <--- Pass the captured gtable here
     width = 8,
     height = dynamic_height,
-    dpi = 300,           # <--- Ensures crisp, publication-grade PNG text
+    dpi = 300, # <--- Ensures crisp, publication-grade PNG text
     bg = "white"
   )
 
@@ -577,7 +577,7 @@ if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
     plot = heatmap_grob,
     width = 8,
     height = dynamic_height,
-    dpi = 300,            # High-resolution output for crisp text scaling
+    dpi = 300, # High-resolution output for crisp text scaling
     bg = "white"
   )
 
@@ -590,8 +590,10 @@ if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
   message("Skipping Heatmap: Wide profile matrix data is missing or empty.") # oopsie daisie message
 }
 ```
-TODO: continue fixing from here
+TODO: adjust output paths from here
 ```{r hierarchical-heatmap-presence-absense, fig.width=7, fig.height=9}
+# ----- hierarchically clustered presence/absence heatmap -----
+
 if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
   # ----- filter and prepare data -----
   # prepare a numeric matrix for clustering using the wide matrix
@@ -618,13 +620,13 @@ if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
   heatmap_out_name <- sprintf("enrichment_heatmap_%s_m%.2f.pdf", db_label, clust_thresh)
   heatmap_out_path <- file.path(results_dir, "reshaped_outputs", heatmap_out_name)
 
-  
+
   # 4. Draw and Save the Clustered Heatmap
   # We use a PDF output here because text labels scale perfectly without pixelating
-  # can also use the pass to ggsave method 
+  # can also use the pass to ggsave method
   pdf(file = heatmap_out_path, width = 8, height = max(6, nrow(heatmap_matrix) * 0.22))
 
-pheat<-  pheatmap(
+  pheat <- pheatmap(
     mat = heatmap_matrix,
     color = c("#f0f0f0", "#2b8cbe"), # Light gray for 0 (Absence), Deep blue for 1 (Enriched)
     legend_breaks = c(0, 1),
@@ -650,9 +652,7 @@ print(pheat)
 ```
 
 ```{r clustered-heatmap-continuous, fig.width=8, fig.height=10}
-# =========================================================================
-# OPTIONAL VISUALIZATION: DYNAMIC CONTINUOUS CLUSTERING HEATMAP
-# =========================================================================
+# ----- hierarchically clustered heatmap with continuous dynamic range -----
 
 if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
   # 1. Transform the dynamic bubble-plot data into a continuous numeric matrix
@@ -687,7 +687,7 @@ if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
   # 4. Generate the plot
   pdf(file = heatmap_continuous_path, width = 8, height = max(6, nrow(continuous_matrix) * 0.22))
 
-p_cont<-  pheatmap(
+  p_cont <- pheatmap(
     mat = continuous_matrix,
     # Using a continuous color gradient (Light gray -> Orange -> Deep Purple)
     color = colorRampPalette(c("#f0f0f0", "#fe9929", "#800026"))(50),

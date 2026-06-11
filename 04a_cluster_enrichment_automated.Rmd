@@ -257,202 +257,227 @@ for (target_db in names(db_configs)) {
     message("Success! Exported three data file variations.")
     
 # ==============================================================================
-    # VISUALIZATION CALCULATIONS (ALL OUTPUT FORMATS CONVERTED TO PNG)
-    # ==============================================================================
-    
-    # ------------------ Plot 1: Basic Dotplot (PNG) ------------------
-    max_terms <- 50
-    plot_data <- final_enrichment_df %>%
-      group_by(Analysis_Group) %>%
-      slice_min(order_by = p.adjust, n = 15, with_ties = FALSE) %>%
-      ungroup() %>%
-      distinct(ID, Description, Analysis_Group, p.adjust, Count) %>%
-      mutate(Term_Label = sprintf("%s: %s", ID, substr(Description, 1, 50))) %>%
-      mutate(Term_Label = fct_reorder(Term_Label, p.adjust, .desc = TRUE))
-    
-    if (nrow(plot_data) > max_terms) {
-      top_terms <- plot_data %>%
-        group_by(Term_Label) %>%
-        summarise(min_p = min(p.adjust)) %>%
-        slice_min(order_by = min_p, n = max_terms, with_ties = FALSE) %>%
-        pull(Term_Label)
-      
-      plot_data <- plot_data %>% filter(Term_Label %in% top_terms)
-    }
-    
-    enrich_plot <- ggplot(plot_data, aes(x = Analysis_Group, y = Term_Label)) +
-      geom_point(aes(size = Count, color = -log10(p.adjust))) +
-      scale_color_viridis_c(name = "-log10(p.adjust)", option = "magma", direction = 1) +
-      scale_size_continuous(name = "Gene Count", range = c(3, 8)) +
-      theme_bw(base_size = 11) +
-      labs(
-        title = sprintf("Functional Enrichment Profile (%s)", target_db),
-        subtitle = "Top enriched terms mapped across analysis groups",
-        x = "Analysis Cluster", y = "Enriched Functional Term"
-      ) +
-      theme(
-        axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
-        axis.text.y = element_text(size = 9),
-        panel.grid.major = element_line(color = "gray95"),
-        plot.title = element_text(face = "bold", size = 14)
-      )
-    
-    plot_out_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_dotplot.png", db_label, clust_thresh, lfc_rescue, n_clusters)
-    plot_out_path <- file.path(results_dir, plot_out_name)
-    dynamic_height <- max(5, length(unique(plot_data$Term_Label)) * 0.25)
-    
-    ggsave(filename = plot_out_path, plot = enrich_plot, width = 9, height = dynamic_height, dpi = 300, bg = "white")
-    print(enrich_plot)
-    
-    # ------------------ Plot 2: Hierarchical Dotplot (PNG) ------------------
-    matrix_prep <- final_enrichment_df %>%
-      mutate(Signal = -log10(p.adjust)) %>%
-      mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
-      select(Row_Label, Analysis_Group, Signal) %>%
-      distinct() %>%
-      pivot_wider(names_from = Analysis_Group, values_from = Signal, values_fill = 0)
-    
-    if (nrow(matrix_prep) > 50) {
-      row_vars <- apply(as.matrix(matrix_prep[, -1]), 1, var)
-      matrix_prep <- matrix_prep[order(-row_vars)[1:50], ]
-    }
-    
-    clust_matrix <- as.matrix(matrix_prep[, -1])
-    rownames(clust_matrix) <- matrix_prep$Row_Label
-    
-    if (nrow(clust_matrix) > 1) {
-      row_hc <- hclust(dist(clust_matrix, method = "euclidean"), method = "complete")
-      ordered_pathways <- rownames(clust_matrix)[row_hc$order]
-    } else {
-      ordered_pathways <- rownames(clust_matrix)
-    }
-    
-    if (ncol(clust_matrix) > 1) {
-      col_hc <- hclust(dist(t(clust_matrix), method = "euclidean"), method = "complete")
-      ordered_clusters <- colnames(clust_matrix)[col_hc$order]
-    } else {
-      ordered_clusters <- colnames(clust_matrix)
-    }
-    
-    plot_data_clustered <- final_enrichment_df %>%
-      mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
-      filter(Row_Label %in% ordered_pathways) %>%
-      mutate(
-        Analysis_Group = factor(Analysis_Group, levels = ordered_clusters),
-        Row_Label      = factor(Row_Label, levels = ordered_pathways)
-      )
-    
-    hier_dotplot <- ggplot(plot_data_clustered, aes(x = Analysis_Group, y = Row_Label)) +
-      geom_point(aes(size = Count, color = -log10(p.adjust))) +
-      scale_color_viridis_c(name = "-log10(p.adjust)", option = "magma", direction = 1) +
-      scale_size_continuous(name = "Gene Count", range = c(3, 8)) +
-      theme_bw(base_size = 11) +
-      labs(
-        title = sprintf("Hierarchical Dot Plot Profile (%s)", target_db),
-        subtitle = "Axes arranged dynamically by profile pattern similarity",
-        x = "Analysis Clusters (Clustered)", y = "Enriched Functional Terms (Clustered)"
-      ) +
-      theme(
-        axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
-        axis.text.y = element_text(size = 9),
-        panel.grid.major = element_line(color = "gray95"),
-        plot.title = element_text(face = "bold", size = 14)
-      )
-    
-    dot_out_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_hierarchical_dotplot.png", db_label, clust_thresh, lfc_rescue, n_clusters)
-    dot_out_path <- file.path(results_dir, dot_out_name)
-    dynamic_height_hier <- max(5, length(ordered_pathways) * 0.22)
-    
-    ggsave(filename = dot_out_path, plot = hier_dotplot, width = 9, height = dynamic_height_hier, dpi = 300, bg = "white")
-    print(hier_dotplot)
-    
-    # ------------------ Plot 3: Presence/Absence Main Heatmap (PNG) ------------------
-    heatmap_matrix <- matrix_wide_df %>%
-      mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
-      select(-ID, -Description) %>%
-      distinct(Row_Label, .keep_all = TRUE) %>%
-      tibble::column_to_rownames("Row_Label") %>%
-      as.matrix()
-    
-    heatmap_matrix <- heatmap_matrix[rowSums(heatmap_matrix) > 0, , drop = FALSE]
-    
-    if (nrow(heatmap_matrix) > 60) {
-      term_variance <- rowSums(heatmap_matrix)
-      heatmap_matrix <- heatmap_matrix[order(-term_variance)[1:60], , drop = FALSE]
-    }
-    
+# VISUALIZATION CALCULATIONS (ALL OUTPUT FORMATS CONVERTED TO PNG)
+# ==============================================================================
+
+# ------------------ Plot 1: Basic Dotplot (PNG) ------------------
+max_terms <- 50
+plot_data <- final_enrichment_df %>%
+  group_by(Analysis_Group) %>%
+  slice_min(order_by = p.adjust, n = 15, with_ties = FALSE) %>%
+  ungroup() %>%
+  distinct(ID, Description, Analysis_Group, p.adjust, Count) %>%
+  mutate(Term_Label = sprintf("%s: %s", ID, substr(Description, 1, 50))) %>%
+  mutate(Term_Label = fct_reorder(Term_Label, p.adjust, .desc = TRUE))
+
+if (nrow(plot_data) > max_terms) {
+  top_terms <- plot_data %>%
+    group_by(Term_Label) %>%
+    summarise(min_p = min(p.adjust), .groups = 'drop') %>%
+    slice_min(order_by = min_p, n = max_terms, with_ties = FALSE) %>%
+    pull(Term_Label)
+  
+  plot_data <- plot_data %>% filter(Term_Label %in% top_terms)
+}
+
+enrich_plot <- ggplot(plot_data, aes(x = Analysis_Group, y = Term_Label)) +
+  geom_point(aes(size = Count, color = -log10(p.adjust))) +
+  scale_color_viridis_c(name = "-log10(p.adjust)", option = "magma", direction = 1) +
+  scale_size_continuous(name = "Gene Count", range = c(3, 8)) +
+  theme_bw(base_size = 11) +
+  labs(
+    title = sprintf("Functional Enrichment Profile (%s)", target_db),
+    subtitle = "Top enriched terms mapped across analysis groups",
+    x = "Analysis Cluster", y = "Enriched Functional Term"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    axis.text.y = element_text(size = 9),
+    panel.grid.major = element_line(color = "gray95"),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+plot_out_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_dotplot.png", db_label, clust_thresh, lfc_rescue, n_clusters)
+plot_out_path <- file.path(results_dir, plot_out_name) # Saved directly to main db folder
+dynamic_height <- max(5, length(unique(plot_data$Term_Label)) * 0.25)
+
+ggsave(filename = plot_out_path, plot = enrich_plot, width = 9, height = dynamic_height, dpi = 300, bg = "white")
+print(enrich_plot)
+
+# ------------------ Plot 2: Hierarchical Dotplot (PNG) ------------------
+matrix_prep <- final_enrichment_df %>%
+  mutate(Signal = -log10(p.adjust)) %>%
+  mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+  select(Row_Label, Analysis_Group, Signal) %>%
+  distinct() %>%
+  pivot_wider(names_from = Analysis_Group, values_from = Signal, values_fill = 0)
+
+if (nrow(matrix_prep) > 50) {
+  row_vars <- apply(as.matrix(matrix_prep[, -1, drop = FALSE]), 1, var)
+  row_vars[is.na(row_vars)] <- 0
+  matrix_prep <- matrix_prep[order(-row_vars)[1:50], ]
+}
+
+clust_matrix <- as.matrix(matrix_prep[, -1, drop = FALSE])
+rownames(clust_matrix) <- matrix_prep$Row_Label
+
+cluster_rows_dot <- nrow(clust_matrix) > 1 && ncol(clust_matrix) > 1 && any(apply(clust_matrix, 1, var) > 0)
+cluster_cols_dot <- ncol(clust_matrix) > 1 && any(apply(clust_matrix, 2, var) > 0)
+
+if (cluster_rows_dot) {
+  row_hc <- hclust(dist(clust_matrix, method = "euclidean"), method = "complete")
+  ordered_pathways <- rownames(clust_matrix)[row_hc$order]
+} else {
+  ordered_pathways <- rownames(clust_matrix)
+}
+
+if (cluster_cols_dot) {
+  col_hc <- hclust(dist(t(clust_matrix), method = "euclidean"), method = "complete")
+  ordered_clusters <- colnames(clust_matrix)[col_hc$order]
+} else {
+  ordered_clusters <- colnames(clust_matrix)
+}
+
+plot_data_clustered <- final_enrichment_df %>%
+  mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+  filter(Row_Label %in% ordered_pathways) %>%
+  mutate(
+    Analysis_Group = factor(Analysis_Group, levels = ordered_clusters),
+    Row_Label      = factor(Row_Label, levels = ordered_pathways)
+  )
+
+hier_dotplot <- ggplot(plot_data_clustered, aes(x = Analysis_Group, y = Row_Label)) +
+  geom_point(aes(size = Count, color = -log10(p.adjust))) +
+  scale_color_viridis_c(name = "-log10(p.adjust)", option = "magma", direction = 1) +
+  scale_size_continuous(name = "Gene Count", range = c(3, 8)) +
+  theme_bw(base_size = 11) +
+  labs(
+    title = sprintf("Hierarchical Dot Plot Profile (%s)", target_db),
+    subtitle = "Axes arranged dynamically by profile pattern similarity",
+    x = "Analysis Clusters", y = "Enriched Functional Terms"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    axis.text.y = element_text(size = 9),
+    panel.grid.major = element_line(color = "gray95"),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+dot_out_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_hierarchical_dotplot.png", db_label, clust_thresh, lfc_rescue, n_clusters)
+dot_out_path <- file.path(results_dir, dot_out_name) # Saved directly to main db folder
+dynamic_height_hier <- max(5, length(ordered_pathways) * 0.22)
+
+ggsave(filename = dot_out_path, plot = hier_dotplot, width = 9, height = dynamic_height_hier, dpi = 300, bg = "white")
+print(hier_dotplot)
+
+# ------------------ Plot 3: Presence/Absence Main Heatmap (PNG) ------------------
+tryCatch({
+  heatmap_matrix_prep <- matrix_wide_df %>%
+    mutate(Row_Label = sprintf("[%s] %s", ID, substr(Description, 1, 40))) %>%
+    select(-ID, -Description) %>%
+    distinct(Row_Label, .keep_all = TRUE) 
+  
+  heatmap_matrix_prep[is.na(heatmap_matrix_prep)] <- 0
+  
+  heatmap_matrix <- heatmap_matrix_prep %>%
+    tibble::column_to_rownames("Row_Label") %>%
+    as.matrix()
+  
+  if (nrow(heatmap_matrix) > 60) {
+    term_variance <- rowSums(heatmap_matrix)
+    heatmap_matrix <- heatmap_matrix[order(-term_variance)[1:60], , drop = FALSE]
+  }
+  
+  if (nrow(heatmap_matrix) > 0) {
     pa_heatmap_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_presence_absence_heatmap.png", db_label, clust_thresh, lfc_rescue, n_clusters)
     pa_heatmap_path <- file.path(results_dir, pa_heatmap_name)
     dynamic_height_pa <- max(6, nrow(heatmap_matrix) * 0.22)
     
-    cluster_rows_flag <- nrow(heatmap_matrix) > 1
-    cluster_cols_flag <- ncol(heatmap_matrix) > 1
+    row_vars <- apply(heatmap_matrix, 1, var)
+    col_vars <- apply(heatmap_matrix, 2, var)
+    cluster_rows_flag <- nrow(heatmap_matrix) > 1 && ncol(heatmap_matrix) > 1 && any(row_vars > 0, na.rm = TRUE)
+    cluster_cols_flag <- ncol(heatmap_matrix) > 1 && any(col_vars > 0, na.rm = TRUE)
     
-    # Open graphics device stream to catch the S4 object safely without using $gtable
     png(filename = pa_heatmap_path, width = 8, height = dynamic_height_pa, units = "in", res = 300, bg = "white")
-    pheatmap(
+    p1 <- pheatmap(
       mat = heatmap_matrix,
       color = c("#f0f0f0", "#2b8cbe"),
       legend_breaks = c(0, 1),
       legend_labels = c("Not Enriched", "Enriched"),
       cluster_rows = cluster_rows_flag,
       cluster_cols = cluster_cols_flag,
-      clustering_distance_rows = "binary",
-      clustering_distance_cols = "binary",
+      clustering_distance_rows = if(cluster_rows_flag) "binary" else "euclidean",
+      clustering_distance_cols = if(cluster_cols_flag) "binary" else "euclidean",
       clustering_method = "complete",
       border_color = "white",
       fontsize_row = 8,
       fontsize_col = 10,
       main = sprintf("Hierarchical Profiles: %s Enrichment", target_db)
     )
+    print(p1)
     dev.off()
     
     # ------------------ Plot 4: Legacy Profile Heatmap (PNG) ------------------
     pa_legacy_name <- sprintf("enrichment_heatmap_%s_m%.2f.png", db_label, clust_thresh)
-    pa_legacy_path <- file.path(subfolder_dir, pa_legacy_name)
+    pa_legacy_path <- file.path(results_dir, pa_legacy_name) # Redirected to results_dir instead of subfolder_dir
     
     png(filename = pa_legacy_path, width = 8, height = dynamic_height_pa, units = "in", res = 300, bg = "white")
-    pheatmap(
+    p2 <- pheatmap(
       mat = heatmap_matrix,
       color = c("#f0f0f0", "#2b8cbe"),
       legend_breaks = c(0, 1),
       legend_labels = c("Not Enriched", "Enriched"),
       cluster_rows = cluster_rows_flag,
       cluster_cols = cluster_cols_flag,
-      clustering_distance_rows = "binary",
-      clustering_distance_cols = "binary",
+      clustering_distance_rows = if(cluster_rows_flag) "binary" else "euclidean",
+      clustering_distance_cols = if(cluster_cols_flag) "binary" else "euclidean",
       clustering_method = "complete",
       border_color = "white",
       fontsize_row = 8,
       fontsize_col = 10,
       main = sprintf("Hierarchical Profiles: %s Enrichment", target_db)
     )
+    print(p2)
     dev.off()
-    
-    # ------------------ Plot 5: Continuous Dynamic Range Heatmap (PNG) ------------------
-    continuous_matrix <- final_enrichment_df %>%
-      mutate(Signal_Strength = -log10(p.adjust)) %>%
-      mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
-      select(Row_Label, Analysis_Group, Signal_Strength) %>%
-      distinct() %>%
-      pivot_wider(names_from = Analysis_Group, values_from = Signal_Strength, values_fill = 0) %>%
-      tibble::column_to_rownames("Row_Label") %>%
-      as.matrix()
-    
-    if (nrow(continuous_matrix) > 50) {
-      row_variances <- apply(continuous_matrix, 1, var)
-      continuous_matrix <- continuous_matrix[order(-row_variances)[1:50], , drop = FALSE]
-    }
-    
+  }
+}, error = function(e) {
+  message(sprintf("Skipped Presence/Absence Heatmaps for %s due to file/matrix issue: %s", db_label, e$message))
+  while (dev.cur() > 1) dev.off() 
+})
+
+# ------------------ Plot 5: Continuous Dynamic Range Heatmap (PNG) ------------------
+tryCatch({
+  continuous_matrix_prep <- final_enrichment_df %>%
+    mutate(Signal_Strength = -log10(p.adjust)) %>%
+    mutate(Row_Label = sprintf("[%s] %s", ID, substr(Description, 1, 40))) %>%
+    select(Row_Label, Analysis_Group, Signal_Strength) %>%
+    distinct() %>%
+    pivot_wider(names_from = Analysis_Group, values_from = Signal_Strength, values_fill = 0)
+  
+  continuous_matrix_prep[is.na(continuous_matrix_prep)] <- 0
+  
+  continuous_matrix <- continuous_matrix_prep %>%
+    tibble::column_to_rownames("Row_Label") %>%
+    as.matrix()
+  
+  if (nrow(continuous_matrix) > 50) {
+    row_variances <- apply(continuous_matrix, 1, var)
+    row_variances[is.na(row_variances)] <- 0
+    continuous_matrix <- continuous_matrix[order(-row_variances)[1:50], , drop = FALSE]
+  }
+  
+  if (nrow(continuous_matrix) > 0) {
     cont_heatmap_name <- sprintf("enrichment_continuous_heatmap_%s_m%.2f.png", db_label, clust_thresh)
-    cont_heatmap_path <- file.path(subfolder_dir, cont_heatmap_name)
+    cont_heatmap_path <- file.path(results_dir, cont_heatmap_name) # Redirected to results_dir instead of subfolder_dir
     dynamic_height_cont <- max(6, nrow(continuous_matrix) * 0.22)
     
-    cluster_rows_cont <- nrow(continuous_matrix) > 1
-    cluster_cols_cont <- ncol(continuous_matrix) > 1
+    cont_row_vars <- apply(continuous_matrix, 1, var)
+    cont_col_vars <- apply(continuous_matrix, 2, var)
+    cluster_rows_cont <- nrow(continuous_matrix) > 1 && ncol(continuous_matrix) > 1 && any(cont_row_vars > 0, na.rm = TRUE)
+    cluster_cols_cont = ncol(continuous_matrix) > 1 && any(cont_col_vars > 0, na.rm = TRUE)
     
     png(filename = cont_heatmap_path, width = 8, height = dynamic_height_cont, units = "in", res = 300, bg = "white")
-    pheatmap(
+    p3 <- pheatmap(
       mat = continuous_matrix,
       color = colorRampPalette(c("#f0f0f0", "#fe9929", "#800026"))(50),
       cluster_rows = cluster_rows_cont,
@@ -465,7 +490,13 @@ for (target_db in names(db_configs)) {
       fontsize_col = 10,
       main = sprintf("Clustered Enrichment Intensity [-log10(p.adj)]: %s", target_db)
     )
+    print(p3)
     dev.off()
+  }
+}, error = function(e) {
+  message(sprintf("Skipped Continuous Heatmap for %s due to error: %s", db_label, e$message))
+  while (dev.cur() > 1) dev.off()
+})
   } else {
     message(sprintf("No valid enrichments passed p/q filtering criteria for %s.", db_label))
   }
