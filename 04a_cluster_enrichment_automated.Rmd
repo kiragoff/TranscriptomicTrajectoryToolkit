@@ -38,7 +38,7 @@ library(jsonlite)
 ```{r data-setup}
 base_dir <- "./"
 base_results <- "./results"
-main_results_dir <- "./results/04-cluster-enrichment-auto-3"
+main_results_dir <- "./results/04-cluster-enrichment-auto-q"
 lookup_dir <- "./lookups"
 
 if (!dir.exists(main_results_dir)) {
@@ -96,7 +96,6 @@ db_configs <- list(
 ```{r make-enrichment-figures}
 # ----- Global Threshold & Metadata Definitions -----
 qtable <- 0.3 # q threshold for out table
-ptable <- 0.1 # p threshold for out table
 clust_thresh <- 0.25 # Baseline cluster membership threshold
 lfc_rescue <- 1 # Log2 Fold Change fallback rescue threshold
 
@@ -200,7 +199,7 @@ for (target_db in names(db_configs)) {
         gene         = current_cluster_genes,
         universe     = universe_vector,
         TERM2GENE    = t2g,
-        pvalueCutoff = ptable,
+        pvalueCutoff = 1,
         qvalueCutoff = qtable,
         minGSSize    = 2,
         maxGSSize    = 500
@@ -233,7 +232,7 @@ for (target_db in names(db_configs)) {
       separate_rows(geneID, sep = "/") %>%
       rename(Gene_ID = geneID) %>%
       select(Analysis_Group, Gene_ID, ID, Description, everything()) %>%
-      arrange(Analysis_Group, Gene_ID, p.adjust)
+      arrange(Analysis_Group, Gene_ID, qvalue)
 
     long_out_path <- file.path(subfolder_dir, paste0(base_name, "_long_by_gene.tsv"))
     write.table(tidy_long_df, long_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
@@ -259,16 +258,16 @@ for (target_db in names(db_configs)) {
         max_terms <- 50
         plot_data <- final_enrichment_df %>%
           group_by(Analysis_Group) %>%
-          slice_min(order_by = p.adjust, n = 15, with_ties = FALSE) %>%
+          slice_min(order_by = qvalue, n = 15, with_ties = FALSE) %>%
           ungroup() %>%
-          distinct(ID, Description, Analysis_Group, p.adjust, Count) %>%
+          distinct(ID, Description, Analysis_Group, qvalue, Count) %>%
           mutate(Term_Label = sprintf("%s: %s", ID, substr(Description, 1, 50))) %>%
-          mutate(Term_Label = fct_reorder(Term_Label, p.adjust, .desc = TRUE))
+          mutate(Term_Label = fct_reorder(Term_Label, qvalue, .desc = TRUE))
 
         if (nrow(plot_data) > max_terms) {
           top_terms <- plot_data %>%
             group_by(Term_Label) %>%
-            summarise(min_p = min(p.adjust), .groups = "drop") %>%
+            summarise(min_p = min(qvalue), .groups = "drop") %>%
             slice_min(order_by = min_p, n = max_terms, with_ties = FALSE) %>%
             pull(Term_Label)
 
@@ -276,8 +275,8 @@ for (target_db in names(db_configs)) {
         }
 
         enrich_plot <- ggplot(plot_data, aes(x = Analysis_Group, y = Term_Label)) +
-          geom_point(aes(size = Count, color = -log10(p.adjust))) +
-          scale_color_viridis_c(name = "-log10(p.adjust)", option = "magma", direction = 1) +
+          geom_point(aes(size = Count, color = -log10(qvalue))) +
+          scale_color_viridis_c(name = "-log10(qvalue)", option = "magma", direction = 1) +
           scale_size_continuous(name = "Gene Count", range = c(3, 8)) +
           theme_bw(base_size = 11) +
           labs(
@@ -308,7 +307,7 @@ for (target_db in names(db_configs)) {
     tryCatch(
       {
         matrix_prep <- final_enrichment_df %>%
-          mutate(Signal = -log10(p.adjust)) %>%
+          mutate(Signal = -log10(qvalue)) %>%
           mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
           select(Row_Label, Analysis_Group, Signal) %>%
           distinct() %>%
@@ -349,8 +348,8 @@ for (target_db in names(db_configs)) {
           )
 
         hier_dotplot <- ggplot(plot_data_clustered, aes(x = Analysis_Group, y = Row_Label)) +
-          geom_point(aes(size = Count, color = -log10(p.adjust))) +
-          scale_color_viridis_c(name = "-log10(p.adjust)", option = "magma", direction = 1) +
+          geom_point(aes(size = Count, color = -log10(qvalue))) +
+          scale_color_viridis_c(name = "-log10(qvalue)", option = "magma", direction = 1) +
           scale_size_continuous(name = "Gene Count", range = c(3, 8)) +
           theme_bw(base_size = 11) +
           labs(
@@ -436,7 +435,7 @@ for (target_db in names(db_configs)) {
     tryCatch(
       {
         continuous_matrix_prep <- final_enrichment_df %>%
-          mutate(Signal_Strength = -log10(p.adjust)) %>%
+          mutate(Signal_Strength = -log10(qvalue)) %>%
           mutate(Row_Label = sprintf("[%s] %s", ID, substr(Description, 1, 40))) %>%
           select(Row_Label, Analysis_Group, Signal_Strength) %>%
           distinct() %>%
@@ -538,9 +537,9 @@ for (target_db in names(db_configs)) {
       )
 
     # Save composite back to database main folder
-    composite_out_path <- file.path(results_dir, sprintf("%s_patchwork_composite_matrix.png", db_label))
+    comp_name <- sprintf("%s_patchwork_composite_matrix.png", db_label)
     ggplot2::ggsave(
-      filename = composite_out_path,
+      filename = file.path(main_results_dir, comp_name),
       plot = composite_grid,
       width = 16,
       # height = 8,
@@ -553,48 +552,5 @@ for (target_db in names(db_configs)) {
   } else {
     message(sprintf(" -> Skipped composite for %s: One or more base PNG figures were missing.", db_label))
   }
-}
-```
-
-```{r gather-summaries}
-message("Running standalone file transfer to 'patchwork' directory...")
-
-# 1. Establish directory pathways
-patchwork_global_dir <- file.path(main_results_dir, "patchwork")
-
-# 2. Safely initialize the destination directory if it does not exist
-if (!dir.exists(patchwork_global_dir)) {
-  dir.create(patchwork_global_dir, recursive = TRUE)
-  message(" -> Created new global 'patchwork' directory.")
-}
-
-# 3. Locate all generated patchwork figures across your database subfolders
-target_files <- list.files(
-  path        = main_results_dir,
-  pattern     = "_patchwork_composite_matrix\\.png$",
-  full.names  = TRUE,
-  recursive   = TRUE
-)
-
-# 4. Execute the file copy operation loop
-if (length(target_files) > 0) {
-  copy_counts <- 0
-
-  for (file_path in target_files) {
-    # Extract just the raw file name (e.g., "KEGG_Pathway_patchwork_composite_matrix.png")
-    file_name <- basename(file_path)
-    destination_path <- file.path(patchwork_global_dir, file_name)
-
-    # Copy file, allowing it to overwrite old runs cleanly
-    success <- file.copy(from = file_path, to = destination_path, overwrite = TRUE)
-
-    if (success) {
-      copy_counts <- copy_counts + 1
-      message(sprintf(" -> Copied: %s", file_name))
-    }
-  }
-  message(sprintf("Success! Transferred %d patchwork matrix figures into: %s", copy_counts, patchwork_global_dir))
-} else {
-  warning("No files matching '*_patchwork_composite_matrix.png' were found in the results directory tree.")
 }
 ```
