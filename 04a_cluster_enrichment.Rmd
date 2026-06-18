@@ -43,7 +43,7 @@ library(tidyr)
 ```{r pre-cleanup}
 base_dir <- "./"
 base_results <- "./results"
-results_dir <- "./results/04-cluster-enrichment"
+results_dir <- "./results/04-cluster-enrichment-check"
 lookup_dir <- "./lookups"
 
 ifelse(!dir.exists(file.path(results_dir)),
@@ -120,9 +120,7 @@ target_db <- "kRxn" # Options: "KO", "kPathway", "kModule", "kRxn", "COG", "COGc
 
 # Threshold variables for output table
 qtable <- 0.3 # q threshold for out table
-ptable <- 0.1 # p threshold for out table
 
-# --- Threshold Metadata (Updated to match your dual-filtering rules) ---
 clust_thresh <- 0.25 # Baseline cluster membership threshold
 lfc_rescue <- 1 # Log2 Fold Change fallback rescue threshold
 
@@ -216,7 +214,7 @@ for (clust_id in all_clusters) {
       gene         = current_cluster_genes,
       universe     = universe_vector,
       TERM2GENE    = t2g,
-      pvalueCutoff = ptable,
+      pvalueCutoff = 1,
       qvalueCutoff = qtable,
       minGSSize    = 2,
       maxGSSize    = 500
@@ -252,7 +250,7 @@ if (length(enrichment_results_list) > 0) {
     separate_rows(geneID, sep = "/") %>%
     rename(Gene_ID = geneID) %>%
     select(Analysis_Group, Gene_ID, ID, Description, everything()) %>%
-    arrange(Analysis_Group, Gene_ID, p.adjust)
+    arrange(Analysis_Group, Gene_ID, qvalue)
 
   long_out_path <- file.path(subfolder_dir, paste0(base_name, "_long_by_gene.tsv"))
   write.table(tidy_long_df, long_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
@@ -297,19 +295,19 @@ if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
   # ----- filter and prepare data -----
   plot_data <- final_enrichment_df %>%
     group_by(Analysis_Group) %>%
-    slice_min(order_by = p.adjust, n = 15, with_ties = FALSE) %>% # Top 15 per cluster
+    slice_min(order_by = qvalue, n = 15, with_ties = FALSE) %>% # Top 15 per cluster
     ungroup() %>%
-    distinct(ID, Description, Analysis_Group, p.adjust, Count) %>%
+    distinct(ID, Description, Analysis_Group, qvalue, Count) %>%
     # create a clean label combining ID and Description
     mutate(Term_Label = sprintf("%s: %s", ID, substr(Description, 1, 50))) %>%
     # order terms by their significance so the plot looks structured
-    mutate(Term_Label = fct_reorder(Term_Label, p.adjust, .desc = TRUE))
+    mutate(Term_Label = fct_reorder(Term_Label, qvalue, .desc = TRUE))
 
   if (nrow(plot_data) > max_terms) {
     # If still too many terms globally, truncate to the top overall
     top_terms <- plot_data %>%
       group_by(Term_Label) %>%
-      summarise(min_p = min(p.adjust)) %>%
+      summarise(min_p = min(qvalue)) %>%
       slice_min(order_by = min_p, n = max_terms, with_ties = FALSE) %>%
       pull(Term_Label)
 
@@ -320,8 +318,8 @@ if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
 
   # shows which clusters share pathways, scaled by gene count and colored by p-value
   enrich_plot <- ggplot(plot_data, aes(x = Analysis_Group, y = Term_Label)) +
-    geom_point(aes(size = Count, color = -log10(p.adjust))) +
-    scale_color_viridis_c(name = "-log10(p.adjust)", option = "magma", direction = 1) +
+    geom_point(aes(size = Count, color = -log10(qvalue))) +
+    scale_color_viridis_c(name = "-log10(qvalue)", option = "magma", direction = 1) +
     scale_size_continuous(name = "Gene Count", range = c(3, 8)) +
     theme_bw(base_size = 11) +
     labs(
@@ -372,7 +370,7 @@ if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
   # ----- filter and prepare data -----
   # Generate matrix
   matrix_prep <- final_enrichment_df %>%
-    mutate(Signal = -log10(p.adjust)) %>%
+    mutate(Signal = -log10(qvalue)) %>%
     mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
     select(Row_Label, Analysis_Group, Signal) %>%
     distinct() %>%
@@ -411,8 +409,8 @@ if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
 
   # ----- generate ordered dotplot -----
   hier_dotplot <- ggplot(plot_data_clustered, aes(x = Analysis_Group, y = Row_Label)) +
-    geom_point(aes(size = Count, color = -log10(p.adjust))) +
-    scale_color_viridis_c(name = "-log10(p.adjust)", option = "magma", direction = 1) +
+    geom_point(aes(size = Count, color = -log10(qvalue))) +
+    scale_color_viridis_c(name = "-log10(qvalue)", option = "magma", direction = 1) +
     scale_size_continuous(name = "Gene Count", range = c(3, 8)) +
     theme_bw(base_size = 11) +
     labs(
@@ -451,146 +449,6 @@ if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
 }
 ```
 
-```{r}
-if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
-  # ----- filter and prepare data -----
-  # prepare a numeric matrix for clustering using the wide matrix
-  heatmap_matrix <- matrix_wide_df %>%
-    # Use the pathway description as the row name so it shows up on the plot
-    mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
-    select(-ID, -Description) %>%
-    # Ensure there are no duplicate row names
-    distinct(Row_Label, .keep_all = TRUE) %>%
-    tibble::column_to_rownames("Row_Label") %>%
-    as.matrix()
-
-  # Only plot terms that are active in at least one cluster
-  heatmap_matrix <- heatmap_matrix[rowSums(heatmap_matrix) > 0, , drop = FALSE]
-
-  # Cap the number of rows if it's too high (usually 50-60)
-  if (nrow(heatmap_matrix) > 60) {
-    message("Notice: Truncating heatmap to the top 60 terms with the most cluster overlaps for readability.")
-    term_variance <- rowSums(heatmap_matrix)
-    heatmap_matrix <- heatmap_matrix[order(-term_variance)[1:60], , drop = FALSE]
-  }
-  # ----- 4. Draw and Save the Clustered Heatmap via ggsave -----
-
-  # Update your file name to .png
-  heatmap_out_name <- sprintf("enrichment_heatmap_%s_m%.2f.png", db_label, clust_thresh)
-  heatmap_out_path <- file.path(results_dir, "reshaped_outputs", heatmap_out_name)
-
-  # CRITICAL: Run pheatmap with silent = TRUE and capture the $gtable
-  heatmap_grob <- pheatmap(
-    mat = heatmap_matrix,
-    color = c("#f0f0f0", "#2b8cbe"),
-    legend_breaks = c(0, 1),
-    legend_labels = c("Not Enriched", "Enriched"),
-    cluster_rows = TRUE,
-    cluster_cols = TRUE,
-    clustering_distance_rows = "binary",
-    clustering_distance_cols = "binary",
-    clustering_method = "complete",
-    border_color = "white",
-    fontsize_row = 8,
-    fontsize_col = 10,
-    main = sprintf("Hierarchical Profiles: %s Enrichment", target_db),
-    silent = TRUE # <--- Prevents it from throwing an erratic plot canvas in the middle of a loop
-  )$gtable
-
-  # Calculate dynamic height to prevent text crowding, just like before
-  dynamic_height <- max(6, nrow(heatmap_matrix) * 0.22)
-
-  # Save perfectly using ggsave
-  ggsave(
-    filename = heatmap_out_path,
-    plot = heatmap_grob, # <--- Pass the captured gtable here
-    width = 8,
-    height = dynamic_height,
-    dpi = 300, # <--- Ensures crisp, publication-grade PNG text
-    bg = "white"
-  )
-
-  # Optional: If you still want to see it print out in your RStudio console/notebook
-  grid::grid.newpage()
-  grid::grid.draw(heatmap_grob)
-
-  message(sprintf("Heatmap Success! Clustered architecture saved to: %s", file.path("reshaped_outputs", heatmap_out_name)))
-} else {
-  message("Skipping Heatmap: Wide profile matrix data is missing or empty.") # oopsie daisie message
-}
-```
-
-
-```{r hierarchical-heatmap-presence-absence, fig.width=7, fig.height=9}
-if (exists("matrix_wide_df") && nrow(matrix_wide_df) > 0) {
-  # ----- filter and prepare data -----
-  # prepare a numeric matrix for clustering using the wide matrix
-  heatmap_matrix <- matrix_wide_df %>%
-    # Use the pathway description as the row name so it shows up on the plot
-    mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
-    select(-ID, -Description) %>%
-    # Ensure there are no duplicate row names
-    distinct(Row_Label, .keep_all = TRUE) %>%
-    tibble::column_to_rownames("Row_Label") %>%
-    as.matrix()
-
-  # Only plot terms that are active in at least one cluster
-  heatmap_matrix <- heatmap_matrix[rowSums(heatmap_matrix) > 0, , drop = FALSE]
-
-  # Cap the number of rows if it's too high (usually 50-60)
-  if (nrow(heatmap_matrix) > 60) {
-    message("Notice: Truncating heatmap to the top 60 terms with the most cluster overlaps for readability.")
-    term_variance <- rowSums(heatmap_matrix)
-    heatmap_matrix <- heatmap_matrix[order(-term_variance)[1:60], , drop = FALSE]
-  }
-
-  # ----- dynamic save (Updated for Database Sorting & Rescue Tracking) -----
-  # Aligned to match your core database grouping standard and switched to PNG extension
-  heatmap_out_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_presence_absence_heatmap.png", db_label, clust_thresh, lfc_rescue, n_clusters)
-  heatmap_out_path <- file.path(results_dir, heatmap_out_name)
-
-  # ----- 4. Draw and Save the Clustered Heatmap via ggsave -----
-  # Run pheatmap with silent = TRUE and capture the grid graphical layout ($gtable)
-  heatmap_grob <- pheatmap(
-    mat = heatmap_matrix,
-    color = c("#f0f0f0", "#2b8cbe"), # Light gray for 0 (Absence), Deep blue for 1 (Enriched)
-    legend_breaks = c(0, 1),
-    legend_labels = c("Not Enriched", "Enriched"),
-    cluster_rows = TRUE, # Dynamically cluster pathways by profile similarity
-    cluster_cols = TRUE, # Dynamically cluster analysis groups by pathway profile
-    clustering_distance_rows = "binary", # 'binary' distance is mathematically best for 1/0 matrices
-    clustering_distance_cols = "binary",
-    clustering_method = "complete",
-    border_color = "white",
-    fontsize_row = 8,
-    fontsize_col = 10,
-    main = sprintf("Hierarchical Profiles: %s Enrichment", target_db),
-    silent = TRUE # Prevents it from throwing erratic plot canvases in a clean loop
-  )$gtable
-
-  # Calculate dynamic height based on the number of active terms to prevent squishing
-  dynamic_height <- max(6, nrow(heatmap_matrix) * 0.22)
-
-  # Save perfectly using ggsave
-  ggsave(
-    filename = heatmap_out_path,
-    plot = heatmap_grob,
-    width = 8,
-    height = dynamic_height,
-    dpi = 300, # High-resolution output for crisp text scaling
-    bg = "white"
-  )
-
-  # Optional: Renders the plot object inside your RStudio interactive view/notebook pane
-  grid::grid.newpage()
-  grid::grid.draw(heatmap_grob)
-
-  message(sprintf("Heatmap Success! Clustered architecture saved to: %s", file.path("reshaped_outputs", heatmap_out_name)))
-} else {
-  message("Skipping Heatmap: Wide profile matrix data is missing or empty.") # oopsie daisie message
-}
-```
-TODO: adjust output paths from here
 ```{r hierarchical-heatmap-presence-absense, fig.width=7, fig.height=9}
 # ----- hierarchically clustered presence/absence heatmap -----
 
@@ -658,7 +516,7 @@ if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
   # 1. Transform the dynamic bubble-plot data into a continuous numeric matrix
   continuous_matrix <- final_enrichment_df %>%
     # Calculate the strength of enrichment (-log10 of adjusted p-value)
-    mutate(Signal_Strength = -log10(p.adjust)) %>%
+    mutate(Signal_Strength = -log10(qvalue)) %>%
     # Truncate long descriptions so the plot labels look clean
     mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
     select(Row_Label, Analysis_Group, Signal_Strength) %>%
