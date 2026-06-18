@@ -1,0 +1,654 @@
+---
+title: "Mahalanobis distances"
+author: "Kira Goff"
+date: "2026-06-16"
+output: html_document
+---
+
+```{r}
+
+```
+
+```{r load-libraries}
+# data manipulation
+library(dplyr)          # Essential for data wrangling (mutate, select, %>% etc.)
+library(tidyr)          # Used for reshaping data (pivot_longer, pivot_wider)
+
+# data visualization
+library(ggplot2)        # Core plotting engine
+library(scales)         # Formatting scales on plot axes (percentages, currency, etc.)
+library(ggrepel)        # Prevents text labels from overlapping on plots
+library(plotly)         # Converts ggplot2 plots into interactive HTML graphics
+
+# bioinformatics analysis
+library(clusterProfiler) # Core functional enrichment analysis tool
+library(KEGGREST)       # Client interface to the KEGG REST API
+```
+
+```{r define-paths}
+base_dir <- "./"
+base_results <- "./results"
+results_dir <- "./results/05-mahalanobis-distance"
+
+if (!dir.exists(results_dir)) {
+  dir.create(results_dir, recursive = TRUE)
+}
+
+```
+
+```{r check-mahalanobis-histogram}
+mahal_dist <- df_final_clusters$mahalanobis_dist
+mahal_max <- max(mahal_dist)
+mahal_full <- hist(mahal_dist)
+print(mahal_full)
+mahal_26 <- hist(mahal_dist, breaks = 26)
+print(mahal_26)
+```
+```{r tight-mahalanobic-hist}
+mahal_tight_dist <- df_final_clusters %>%
+  filter(mahalanobis_dist <= 10)
+mahal_tight <- mahal_tight_dist$mahalanobis_dist
+hist(mahal_tight)
+
+```
+
+```{r new-runs-on-existing-dataframes}
+
+# 1. Filter for high-leverage Mahalanobis outliers that show split fuzzy membership
+# Adjust thresholds dynamically based on your dataset's specific distributions
+bridge_drivers <- df_final_clusters %>%
+  filter(
+#    is_driver == "High-Confidence" & 
+    membership_score < 0.50 # Low primary assignment score = high multi-cluster uncertainty
+  ) %>%
+  arrange(desc(mahalanobis_dist))
+
+# 2. Left-join with your operon and pathway annotation dataset
+annotated_bridge_drivers <- bridge_drivers %>%
+  left_join(anno_operon_clean, by = "Gene") %>%
+  select(
+    Gene, 
+    cluster, 
+    membership_score, 
+    mahalanobis_dist, 
+    operon, 
+    Product, 
+    KO_def, 
+    KEGG_Pathway, 
+    KEGG_path_def
+  )
+
+# Print a summary report of your top network-shifting bridge genes
+message(sprintf("Identified %d high-leverage multi-mapping bridge drivers.", nrow(annotated_bridge_drivers)))
+print(head(annotated_bridge_drivers, 10))
+
+# 3. Optional: Export this prioritized gene list for separate pathway enrichment loops
+write.csv(annotated_bridge_drivers, file.path(results_dir,"priority_multivariate_bridge_drivers.csv"), row.names = FALSE)
+```
+
+
+```{r graph-mahal-vs-cluster-membership}
+# 1. Recreate your Glasbey color mapping table
+k_final <- k_used
+base_colors <- as.vector(pals::glasbey(k_final))
+
+color_map <- data.frame(
+  cluster    = 1:k_final,  # Numeric matching your df_final_clusters data layout
+  base_color = base_colors,
+  stringsAsFactors = FALSE
+)
+
+# 2. Merge mapping and calculate continuous opacity scales based on Mahalanobis distance
+df_topology_data <- df_final_clusters %>%
+  mutate(cluster = as.numeric(as.character(cluster))) %>% # Force numeric alignment for join
+  inner_join(color_map, by = "cluster") %>%
+  mutate(
+    # Normalize Mahalanobis distance between 0.25 (faint background) and 1.0 (max driver peak)
+    norm_dist = scales::rescale(mahalanobis_dist, to = c(0.25, 1.0)),
+    
+    # Convert normalized distance to hex alpha values (0 to 255)
+    hex_alpha = sprintf("%02X", as.integer(norm_dist * 255)),
+    
+    # Stitch base color together with its custom continuous alpha value
+    final_color = paste0(base_color, hex_alpha)
+  )
+
+# legend for custom colour scheme
+legend_guide_map <- df_topology_data %>%
+  select(cluster, base_color) %>%
+  distinct() %>%
+  arrange(cluster)
+
+
+p_topology_static <- ggplot(df_topology_data, aes(
+  x = membership_score,
+  y = mahalanobis_dist,
+  color = final_color,
+  text = paste0(
+    "<b>Gene:</b> ", Gene, "<br>",
+    "<b>Fuzzy Cluster:</b> ", cluster, "<br>",
+    "<b>Membership Score:</b> ", round(membership_score, 3), "<br>",
+    "<b>Mahalanobis Dist:</b> ", round(mahalanobis_dist, 2)
+  )
+)) +
+  geom_point(aes(size = mahalanobis_dist), alpha = 1.0) +
+  
+  # Set horizontal/vertical topology guides
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "gray60", size = 0.4) +
+  
+  scale_size_continuous(range = c(1.0, 3.5), guide = "none") +
+  
+  # map our unified breaks and labels vectors to keep lengths identical
+  scale_color_identity(
+    name   = "Cluster",
+    guide  = "legend",
+    breaks = legend_guide_map$base_color,
+    labels = legend_guide_map$cluster
+  ) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Continuous Driver Topology Across Fuzzy Clusters",
+    subtitle = "Solid opacity mirrors strong Mahalanobis leverage; Background context fades away",
+    x = "Primary Cluster Membership Score (Lower = Higher Multi-Mapping / Bridge Multi-Tasking)",
+    y = "Mahalanobis Distance (Multivariate Feature Leverage)"
+  ) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+# Save and export
+figname_topology <- sprintf("driver-topology-%.0fclust-lg2fc%.1f-memb%.2f.png", k_final, r_thresh, score_thresh)
+ggsave(file.path(results_dir, figname_topology), plot = p_topology_static, width = 8, height = 6, dpi = 300)
+
+p_topology_static
+```
+
+```{r bridge-distance}
+df_clusters_prep <- df_final_clusters %>%
+  mutate(
+    Gene = as.character(Gene),
+    cluster = as.numeric(as.character(cluster))
+  )
+
+anno_prep <- anno_operon_clean %>%
+  mutate(Gene = as.character(Gene))
+
+# 2. Build the Comprehensive Continuous Topology Matrix
+master_topology_matrix <- df_clusters_prep %>%
+  left_join(anno_prep, by = "Gene") %>%
+  mutate(
+    # High score = High Mahalanobis Distance AND Low Primary Membership (Split variance)
+    Bridge_Priority_Score = mahalanobis_dist * (1 - membership_score)
+  ) %>%
+  select(
+    Gene,
+    cluster,
+    membership_score,
+    mahalanobis_dist,
+    Bridge_Priority_Score,
+    model_LFC_06h,
+    model_LFC_24h,
+    operon,
+    Product,
+    KO,
+    KO_def,
+    KEGG_Pathway,
+    KEGG_path_def,
+    GO_bak
+  ) %>%
+  # Sort the genome so the most impactful network-shifters are at the top
+  arrange(desc(Bridge_Priority_Score))
+
+# 3. Verify the extraction metrics
+message("--- STEP 1 VERIFICATION ---")
+message(sprintf("Master Topology Matrix built successfully with %d genes.", nrow(master_topology_matrix)))
+message(sprintf("Missing annotations caught: %d genes lack KEGG pathway definitions.", sum(is.na(master_topology_matrix$KEGG_Pathway))))
+
+# Preview the top 5 highest priority continuous genes
+print(head(master_topology_matrix, 5))
+```
+
+
+The Benjamini-Hochberg p.adj value assumes that there are no enrichments at all in a dataset (all null)
+The Storey q value uses p-value histograms of the dataset to calculate the appropriate proportion of null tests
+Because we have thousands of genes and terms, the q value is more accurate for our dataset
+
+I'm splitting KEGG and COG because of different source for the additional annotation
+```{r kegg-based-enrichment}
+# define variables
+qtable <- 0.1 
+mahal_cut <- 4      # Globally flags multivariate outliers on 06h vs 24h scatterplot
+fc_cut    <- 0.5    # Specifically captures upregulation at 6h OR 24h
+
+target_databases <- c("KO", "kPathway", "kModule", "kRxn")
+
+# Setup subfolder for reshaped outputs
+subfolder_dir <- file.path(results_dir, "reshaped_outputs")
+if (!dir.exists(subfolder_dir)) dir.create(subfolder_dir, recursive = TRUE)
+
+# Keywords to filter out housekeeping/structural terms
+housekeeping_terms <- c(
+  "\\b5s\\b", "\\b16s\\b", "\\b23s\\b", 
+  "rrna", 
+  "ribosomal protein", 
+  "^ribosomal large subunit$", 
+  "^ribosomal small subunit$",
+  "sigma factor", "rna polymerase"
+)
+
+# --- helper fn for annotation ---
+get_kegg_layer_metadata <- function(ids, db_type) {
+  if (length(ids) == 0) return(NULL)
+  message(sprintf("--> Querying KEGG API for %d enriched %s terms...", length(unique(ids)), db_type))
+  
+  results <- list()
+  
+  for (id in unique(ids)) {
+    clean_id <- gsub("ko:|path:|md:|rn:", "", id)
+    
+    tryCatch({
+      kegg_data <- keggGet(clean_id)[[1]]
+      
+      pathways <- NA; modules <- NA; reactions <- NA; class_hierarchy <- NA
+      
+      if (!is.null(kegg_data$PATHWAY)) {
+        pathways <- paste(names(kegg_data$PATHWAY), kegg_data$PATHWAY, sep=": ", collapse=" | ")
+      }
+      if (!is.null(kegg_data$MODULE)) {
+        modules <- paste(names(kegg_data$MODULE), kegg_data$MODULE, sep=": ", collapse=" | ")
+      }
+      if (!is.null(kegg_data$REACTION)) {
+        reactions <- paste(kegg_data$REACTION, collapse=", ")
+      }
+      if (!is.null(kegg_data$CLASS)) {
+        class_hierarchy <- kegg_data$CLASS
+      }
+      
+      if (db_type == "KO") {
+        results[[clean_id]] <- data.frame(ID = id, Pathways = pathways, Modules = modules, Reactions = reactions, stringsAsFactors = FALSE)
+      } else if (db_type == "kModule") {
+        results[[clean_id]] <- data.frame(ID = id, Parent_Pathways = pathways, Functional_Class = class_hierarchy, stringsAsFactors = FALSE)
+      } else if (db_type == "kPathway") {
+        results[[clean_id]] <- data.frame(ID = id, Pathway_Class = class_hierarchy, stringsAsFactors = FALSE)
+      } else if (db_type == "kRxn") {
+        definition <- ifelse(!is.null(kegg_data$DEFINITION), kegg_data$DEFINITION, NA)
+        enzymes    <- ifelse(!is.null(kegg_data$ENZYME), paste(kegg_data$ENZYME, collapse=", "), NA)
+        results[[clean_id]] <- data.frame(ID = id, Equation = definition, Enzymes_EC = enzymes, Modules = modules, Pathways = pathways, stringsAsFactors = FALSE)
+      }
+      
+    }, error = function(e) {
+      results[[clean_id]] <- data.frame(ID = id, stringsAsFactors = FALSE)
+    })
+  }
+  return(bind_rows(results))
+}
+
+# --- loop through databases ---
+
+for (target_db in target_databases) {
+  
+  message(sprintf("\n=== Processing Enrichment for Database: %s ===", target_db))
+  
+  # 1. Dynamically assign configuration variables
+  db_label          <- db_configs[[target_db]]$db_label
+  database_tsv_path <- db_configs[[target_db]]$database_tsv_path
+  db_term_col       <- db_configs[[target_db]]$db_term_col
+  db_definition_col <- db_configs[[target_db]]$db_definition_col
+  
+  # Load term definitions safely
+  clean_defs <- read.delim(database_tsv_path, sep = "\t", stringsAsFactors = FALSE) %>%
+    select(ID = !!sym(db_term_col), Description = !!sym(db_definition_col)) %>%
+    distinct()
+  
+  # 2. Define database-specific universe
+  raw_universe_genes <- rownames(dds)
+  
+  t2g_base <- anno_operon_clean %>%
+    filter(Gene %in% raw_universe_genes) %>%
+    select(!!sym(db_label), Gene) %>%
+    drop_na(!!sym(db_label))
+  
+  if (db_label == "COG_cat") {
+    t2g_split <- t2g_base %>%
+      mutate(!!sym(db_label) := gsub("[ ,]", "", !!sym(db_label))) %>%
+      separate_rows(!!sym(db_label), sep = "")
+  } else {
+    t2g_split <- t2g_base %>%
+      separate_rows(!!sym(db_label), sep = ",\\s*")
+    
+    if (target_db == "kPathway") {
+      t2g_split <- t2g_split %>%
+        filter(grepl("^map\\d+", !!sym(db_label)))
+    }
+  }
+  
+  # Filter out structural/housekeeping annotations
+  t2g <- t2g_split %>%
+    rename(ID = !!sym(db_label)) %>%
+    left_join(clean_defs, by = "ID") %>%
+    filter(!grepl(paste(housekeeping_terms, collapse = "|"),
+                  Description,
+                  ignore.case = TRUE
+    )) %>%
+    select(term_id = ID, gene_id = Gene) %>%
+    filter(term_id != "" & term_id != "NA") %>%
+    distinct()
+  
+  universe_vector <- unique(t2g$gene_id)
+  
+  # 3. Dynamic Driver Gene Generation (Scoped to current universe background)
+  driver_genes <- master_topology_matrix %>%
+    filter(
+      mahalanobis_dist > mahal_cut,
+      model_LFC_06h >= fc_cut | model_LFC_24h >= fc_cut
+    ) %>%
+    filter(Gene %in% universe_vector) %>% 
+    select(Gene) %>%
+    distinct()
+  
+  flagged_genes_vector <- driver_genes %>% pull(Gene)
+  
+  # Skip to next DB if no driver genes map to this database's universe
+  if (length(intersect(flagged_genes_vector, universe_vector)) == 0) {
+    message(sprintf("Skipping %s: No flagged driver genes exist in this functional annotation universe.", target_db))
+    next
+  }
+  
+  # 4. Enrichment Analysis
+  enrichment_results_list <- list()
+  
+  # OPTIMIZED: pvalueCutoff = 1 lets Storey's q-value exclusively control significance thresholds
+  # cluster enricher applies p to p and p.adj
+  ego <- enricher(
+    gene         = flagged_genes_vector,
+    universe     = universe_vector,
+    TERM2GENE    = t2g,
+    pvalueCutoff = 1,
+    qvalueCutoff = qtable,
+    minGSSize    = 2,
+    maxGSSize    = 500
+  )
+  
+  if (!is.null(ego) && nrow(ego@result) > 0) {
+    res_df <- as.data.frame(ego) %>%
+      mutate(Analysis_Group = "Mahalanobis_Outliers")
+    enrichment_results_list[["Mahalanobis_Outliers"]] <- res_df
+  }
+  
+  # 5. Annotate and save
+  if (length(enrichment_results_list) > 0) {
+    final_enrichment_df <- bind_rows(enrichment_results_list) %>%
+      select(-any_of("Description")) %>%
+      left_join(clean_defs, by = "ID") %>%
+      select(Analysis_Group, ID, Description, Count, everything())
+    
+    # INTERCEPT & EXTEND: Only target explicit KEGG prefixes for live metadata injection
+    if (target_db %in% c("KO", "kPathway", "kModule", "kRxn")) {
+      kegg_meta <- get_kegg_layer_metadata(final_enrichment_df$ID, target_db)
+      
+      if (!is.null(kegg_meta) && nrow(kegg_meta) > 0) {
+        final_enrichment_df <- final_enrichment_df %>%
+          left_join(kegg_meta, by = "ID")
+      }
+    }
+    
+    # re-order for ease of visual interpretation
+    final_enrichment_df <- final_enrichment_df %>%
+      relocate(qvalue, .after = ID) %>%
+      select(Analysis_Group, ID, qvalue, Description, 
+               any_of(c("Equation", "Enzymes_EC", "Modules", "Pathways", "Parent_Pathways", "Functional_Class", "Pathway_Class")), 
+               everything())
+    
+    # pull file information for naming
+    n_enriched_terms <- nrow(final_enrichment_df)
+    n_enriched_genes <- final_enrichment_df %>%
+      separate_rows(geneID, sep = "/") %>%
+      pull(geneID) %>%
+      n_distinct()
+    
+    # save names
+    base_name <- sprintf("%s_enrichment_mahal%.1f_lfc%.2f_q%.1f_nterms%d_ngenes%d", 
+                         db_label, mahal_cut, fc_cut, qtable, n_enriched_terms, n_enriched_genes)
+    
+    # File 1: Standard output 
+    original_out_path <- file.path(results_dir, paste0(base_name, ".tsv"))
+    write.table(final_enrichment_df %>% select(-any_of("Analysis_Group")), original_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+    
+    # File 2: Long format by gene 
+    tidy_long_df <- final_enrichment_df %>%
+      separate_rows(geneID, sep = "/") %>%
+      rename(Gene_ID = geneID) %>%
+      select(Analysis_Group, Gene_ID, ID, everything()) %>%
+      arrange(Analysis_Group, Gene_ID, p.adjust)
+    
+    long_out_path <- file.path(subfolder_dir, paste0(base_name, "_long_by_gene.tsv"))
+    write.table(tidy_long_df, long_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+    
+    # File 3: Matrix profile wide
+    matrix_wide_df <- final_enrichment_df %>%
+      mutate(Enriched = 1) %>%
+      select(ID, Analysis_Group, Enriched) %>%
+      distinct() %>%
+      pivot_wider(
+        names_from = Analysis_Group,
+        values_from = Enriched,
+        values_fill = 0
+      ) %>%
+      arrange(ID)
+    
+    wide_out_path <- file.path(subfolder_dir, paste0(base_name, "_profile_matrix.tsv"))
+    write.table(matrix_wide_df, wide_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+    
+    # Console status logs
+    message(sprintf("Successfully exported outputs for %s:", db_label))
+    message(sprintf("  -> %s", basename(original_out_path)))
+    
+  } else {
+    message(sprintf("No significant enrichment found for %s (Mahal > %.1f, LFC >= %.2f, q-value <= %.2f).", 
+                    db_label, mahal_cut, fc_cut, qtable))
+  }
+}
+
+message("\n*** All database enrichment loops completed! ***")
+```
+
+```{r cog-enrichment}
+# define variables
+target_databases <- c("COG", "COGcat")
+qtable <- 0.1 
+mahal_cut <- 4      # Threshold for outliers on 06h vs 24h scatterplot
+fc_cut    <- 0.5    # Specifically captures upregulation at 6h OR 24h
+
+# Setup subfolder for reshaped outputs
+subfolder_dir <- file.path(results_dir, "reshaped_outputs")
+if (!dir.exists(subfolder_dir)) dir.create(subfolder_dir, recursive = TRUE)
+
+# Keywords to filter out housekeeping/structural terms
+housekeeping_terms <- c(
+  "\\b5s\\b", "\\b16s\\b", "\\b23s\\b", 
+  "rrna", 
+  "ribosomal protein", 
+  "^ribosomal large subunit$", 
+  "^ribosomal small subunit$",
+  "sigma factor", "rna polymerase"
+)
+
+# Path to the comprehensive COG master lookup file for additional downstream annotation
+cog_master_lookup_path <- "/mnt/work-drive/databases/COG-KEGG-data/cog-def.tsv"
+
+# --- databases ---
+
+for (target_db in target_databases) {
+  
+  message(sprintf("\n=== Processing Enrichment for Database: %s ===", target_db))
+  
+  # 1. database variables
+  db_label          <- db_configs[[target_db]]$db_label
+  database_tsv_path <- db_configs[[target_db]]$database_tsv_path
+  db_term_col       <- db_configs[[target_db]]$db_term_col
+  db_definition_col <- db_configs[[target_db]]$db_definition_col
+  
+  # Load term definitions safely
+  clean_defs <- read.delim(database_tsv_path, sep = "\t", stringsAsFactors = FALSE) %>%
+    select(ID = !!sym(db_term_col), Description = !!sym(db_definition_col)) %>%
+    distinct()
+  
+  # 2. Define database-specific universe
+  raw_universe_genes <- rownames(dds)
+  
+  t2g_base <- anno_operon_clean %>%
+    filter(Gene %in% raw_universe_genes) %>%
+    select(!!sym(db_label), Gene) %>%
+    drop_na(!!sym(db_label))
+  
+  if (db_label == "COG_cat") {
+    t2g_split <- t2g_base %>%
+      mutate(!!sym(db_label) := gsub("[ ,]", "", !!sym(db_label))) %>%
+      separate_rows(!!sym(db_label), sep = "")
+  } else {
+    t2g_split <- t2g_base %>%
+      separate_rows(!!sym(db_label), sep = ",\\s*")
+  }
+  
+  # Filter out structural/housekeeping annotations
+  t2g <- t2g_split %>%
+    rename(ID = !!sym(db_label)) %>%
+    left_join(clean_defs, by = "ID") %>%
+    filter(!grepl(paste(housekeeping_terms, collapse = "|"),
+                  Description,
+                  ignore.case = TRUE
+    )) %>%
+    select(term_id = ID, gene_id = Gene) %>%
+    filter(term_id != "" & term_id != "NA") %>%
+    distinct()
+  
+  universe_vector <- unique(t2g$gene_id)
+  
+  # 3. Dynamic Driver Gene Generation (Scoped to current universe background)
+  driver_genes <- master_topology_matrix %>%
+    filter(
+      mahalanobis_dist > mahal_cut,
+      model_LFC_06h >= fc_cut | model_LFC_24h >= fc_cut
+    ) %>%
+    filter(Gene %in% universe_vector) %>% 
+    select(Gene) %>%
+    distinct()
+  
+  flagged_genes_vector <- driver_genes %>% pull(Gene)
+  
+  # Skip to next DB if no driver genes map to this database's universe
+  if (length(intersect(flagged_genes_vector, universe_vector)) == 0) {
+    message(sprintf("Skipping %s: No flagged driver genes exist in this functional annotation universe.", target_db))
+    next
+  }
+  
+  # 4. Enrichment analysis
+  enrichment_results_list <- list()
+  
+  ego <- enricher(
+    gene         = flagged_genes_vector,
+    universe     = universe_vector,
+    TERM2GENE    = t2g,
+    pvalueCutoff = 1,
+    qvalueCutoff = qtable,
+    minGSSize    = 2,
+    maxGSSize    = 500
+  )
+  
+  if (!is.null(ego) && nrow(ego@result) > 0) {
+    res_df <- as.data.frame(ego) %>%
+      mutate(Analysis_Group = "Mahalanobis_Outliers")
+    enrichment_results_list[["Mahalanobis_Outliers"]] <- res_df
+  }
+  
+  # 5. annotate and safe
+  if (length(enrichment_results_list) > 0) {
+    final_enrichment_df <- bind_rows(enrichment_results_list) %>%
+      select(-any_of("Description")) %>%
+      left_join(clean_defs, by = "ID")
+    
+    # POST-HOC EXTRA ANNOTATION: Local layer injection exclusively for COG terms
+    if (target_db == "COG" && file.exists(cog_master_lookup_path)) {
+      message("--> Mapping local metadata definitions from master cog-def.tsv...")
+      
+      # Read extra descriptive metadata from master file
+      cog_metadata <- read.delim(cog_master_lookup_path, sep = "\t", stringsAsFactors = FALSE) %>%
+        select(ID = COG, cFunction, Ccode) %>%
+        distinct()
+      
+      # Read the functional category single-letter definitions file 
+      # (maps single-letter Ccode to its verbose phrase ccodedef)
+      cog_cat_metadata <- read.delim(db_configs[["COGcat"]]$database_tsv_path, sep = "\t", stringsAsFactors = FALSE) %>%
+        select(Ccode = COG_code, ccodedef = cCodeDef) %>%
+        distinct()
+      
+      # Join extra variables to main data frames
+      final_enrichment_df <- final_enrichment_df %>%
+        left_join(cog_metadata, by = "ID") %>%
+        left_join(cog_cat_metadata, by = "Ccode")
+    }
+    
+    
+    
+    # do the clean up and reorganize thing
+    # Moves qvalue up and sets custom positioning for extra COG columns if present
+    final_enrichment_reorg <- final_enrichment_df %>%
+      relocate(qvalue, .after = ID) %>%
+      select(Analysis_Group, ID, qvalue, Description, 
+             any_of(c("cFunction", "Ccode", "ccodedef")), 
+             Count, everything())
+    
+    # pull stats for file name
+    n_enriched_terms <- nrow(final_enrichment_df)
+    n_enriched_genes <- final_enrichment_df %>%
+      separate_rows(geneID, sep = "/") %>%
+      pull(geneID) %>%
+      n_distinct()
+    
+    # dynamic file naming
+    base_name <- sprintf("%s_enrichment_mahal%.1f_lfc%.2f_q%.1f_nterms%d_ngenes%d", 
+                         db_label, mahal_cut, fc_cut, qtable, n_enriched_terms, n_enriched_genes)
+    
+    # Standard output
+    original_out_path <- file.path(results_dir, paste0(base_name, ".tsv"))
+    write.table(final_enrichment_df %>% select(-any_of("Analysis_Group")), original_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+    
+    # File 2: Long format by gene 
+    tidy_long_df <- final_enrichment_df %>%
+      separate_rows(geneID, sep = "/") %>%
+      rename(Gene_ID = geneID) %>%
+      select(Analysis_Group, Gene_ID, ID, everything()) %>%
+      arrange(Analysis_Group, Gene_ID, p.adjust)
+    
+    long_out_path <- file.path(subfolder_dir, paste0(base_name, "_long_by_gene.tsv"))
+    write.table(tidy_long_df, long_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+    
+    # File 3: Matrix wide
+    matrix_wide_df <- final_enrichment_df %>%
+      mutate(Enriched = 1) %>%
+      select(ID, Analysis_Group, Enriched) %>%
+      distinct() %>%
+      pivot_wider(
+        names_from = Analysis_Group,
+        values_from = Enriched,
+        values_fill = 0
+      ) %>%
+      arrange(ID)
+    
+    wide_out_path <- file.path(subfolder_dir, paste0(base_name, "_profile_matrix.tsv"))
+    write.table(matrix_wide_df, wide_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+    
+    # Console status logs
+    message(sprintf("Successfully exported outputs for %s:", db_label))
+    message(sprintf("  --> %s", basename(original_out_path)))
+    
+  } else {
+    message(sprintf("No significant enrichment found for %s (Mahal > %.1f, LFC >= %.2f, q-value <= %.2f).", 
+                    db_label, mahal_cut, fc_cut, qtable))
+  }
+}
+
+message("\n*** COG/COGcat functional enrichment runs completed! ***")
+```
