@@ -1,0 +1,1127 @@
+---
+title: "07_additional_visualization"
+author: "Kira Goff"
+date: "2026-06-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(ComplexUpset)
+library(dplyr)
+library(stringr)
+```
+
+```{r}
+results_dir <- "./results/07-additional-vis"
+if (!dir.exists(results_dir)) {
+  dir.create(results_dir, recursive = TRUE)
+}
+```
+
+
+```{r}
+strong_up_06h <- 1
+weak_up_06h <- 0.5
+strong_down_06h <- -1.0
+weak_down_06h <- 0.5
+
+strong_up_24h <- 1
+weak_up_24h <- 0.5
+strong_down_24h <- -1.0
+weak_down_24h <- 0.5
+
+
+# 1. Filter and Build Buckets
+df_binned <- anno_operon_stats %>%
+  # Filter: keep only genes significant in at least one of these two conditions
+  filter(padj_exp < 0.05 | padj_int < 0.05) %>%
+  
+  # Create the buckets based on LFC and padj at each timepoint
+  mutate(
+    # --- 06h Buckets ---
+    bucket_06h = case_when(
+      padj_06h < 0.05 & model_LFC_06h >= strong_up_06h  ~ "Strong_Up",
+      padj_06h < 0.05 & model_LFC_06h >= weak_up_06h  ~ "Weak_Up",
+      padj_06h < 0.05 & model_LFC_06h <= strong_down_06h ~ "Strong_Down",
+      padj_06h < 0.05 & model_LFC_06h <= weak_up_06h ~ "Weak_Down",
+      TRUE                                    ~ "No_Change"
+    ),
+    # --- 24h Buckets ---
+    bucket_24h = case_when(
+      padj_24h < 0.05 & model_LFC_24h >= strong_up_24h  ~ "Strong_Up",
+      padj_24h < 0.05 & model_LFC_24h >= weak_up_24h  ~ "Weak_Up",
+      padj_24h < 0.05 & model_LFC_24h <= strong_down_24h ~ "Strong_Down",
+      padj_24h < 0.05 & model_LFC_24h <= weak_down_06h ~ "Weak_Down",
+      TRUE                                    ~ "No_Change"
+    )
+  )
+
+# 2. Reshape into a Binary Matrix for the UpSet plot
+df_upset <- df_binned %>%
+  select(Gene, bucket_06h, bucket_24h) %>%
+  pivot_longer(cols = starts_with("bucket_"), names_to = "Timepoint", values_to = "Bucket") %>%
+  mutate(
+    Timepoint = str_remove(Timepoint, "bucket_"),
+    Set_Name = paste(Timepoint, Bucket, sep = "_")
+  ) %>%
+  # Drop "No_Change" so it doesn't crowd the plot
+  filter(Bucket != "No_Change") %>%
+  select(Gene, Set_Name) %>%
+  mutate(Present = TRUE) %>%
+  pivot_wider(names_from = Set_Name, values_from = Present, values_fill = FALSE)
+
+# Extract the set names for the upset function
+all_sets <- colnames(df_upset)[-1]
+```
+
+```{r}
+library(ComplexUpset)
+library(ggplot2)
+
+# 1. Cleanly isolate the column names to avoid any indexing offsets
+set_columns <- as.character(all_sets)
+
+# 2. Make sure the matrix columns are strictly logical (TRUE/FALSE) 
+# as ComplexUpset can act up if they are read as numeric or factors
+df_plot_ready[set_columns] <- lapply(df_plot_ready[set_columns], as.logical)
+
+# 3. Generate the clean plot using basic syntax
+# Explicitly use the ComplexUpset namespace to prevent conflicts
+ComplexUpset::upset(
+  data = df_plot_ready,
+  intersect = set_columns,
+  width_ratio = 0.2,
+  min_size = 3,
+  wrap = TRUE
+) + ggplot2::labs(title = "Regulation Groups")
+```
+
+```{r}
+library(tidyverse)
+library(ComplexUpset)
+library(ggplot2)
+
+# Make sure you are using your un-split dataset for a clean, error-free base plot
+set_columns <- as.character(all_sets)
+
+ComplexUpset::upset(
+  data = df_plot_ready,
+  intersect = set_columns,
+  min_size = 5,
+  width_ratio = 0.2,
+  wrap = TRUE,
+  
+  # Queries layer allows you to highlight specific intersection criteria
+  queries = list(
+    # Highlight intersections containing 06h Strong Up
+    ComplexUpset::upset_query(
+      set = "06h_Strong_Up",
+      color = "firebrick",
+      fill = "firebrick"
+    ),
+    # Highlight intersections containing 24h Strong Up
+    ComplexUpset::upset_query(
+      set = "24h_Strong_Up",
+      color = "darkorange",
+      fill = "darkorange"
+    )
+  )
+) + ggplot2::labs(title = "Gene Regulation with Highlighted Strong Up-Regulation")
+```
+
+```{r}
+library(shiny)
+library(tidyverse)
+library(DT)
+
+# 1. Clean and filter the dataset FIRST before running the app
+# Combines your keywords into an "OR" regex pattern (e.g., "term1|term2|term3")
+filter_pattern <- paste(housekeeping_terms, collapse = "|")
+
+df_app_filtered <- df_binned %>%
+  filter(!across(
+    c(Gene, Product, COG_def, KEGG_module_def), 
+    ~ str_detect(tolower(as.character(.x)), regex(filter_pattern, ignore_case = TRUE))
+  ) %>% rowSums(na.rm = TRUE) > 0)
+
+# --- UI Layout ---
+ui <- fluidPage(
+  titlePanel("Interactive Gene Exploration: Text Search Highlighting"),
+  sidebarLayout(
+    sidebarPanel(
+      width = 3,
+      helpText("Instructions:"),
+      helpText("1. Type any keyword below to highlight matching genes on the plot."),
+      helpText("2. Click and drag a box (brush) on the plot to filter the table further."),
+      hr(),
+      
+      # Text Search Box
+      textInput("text_search", "Search Metadata (Case-Insensitive):", value = ""),
+      span(textOutput("match_count"), style = "font-weight: bold; color: #2c3e50;"),
+      
+      hr(),
+      selectInput("filter_06h", "Quick Filter 06h Bucket:", 
+                  choices = c("All", unique(df_app_filtered$bucket_06h))),
+      selectInput("filter_24h", "Quick Filter 24h Bucket:", 
+                  choices = c("All", unique(df_app_filtered$bucket_24h)))
+    ),
+    
+    mainPanel(
+      width = 9,
+      plotOutput("scatter_plot", brush = brushOpts(id = "plot_brush", resetOnNew = FALSE)),
+      br(),
+      h4("Selected/Highlighted Genes Functional Annotations"),
+      DTOutput("metadata_table")
+    )
+  )
+)
+
+# --- Server Logic ---
+server <- function(input, output, session) {
+  
+  # Reactive dataset handling text searching AND dropdown filters
+  processed_data <- reactive({
+    data <- df_app_filtered
+    
+    if (input$filter_06h != "All") data <- data %>% filter(bucket_06h == input$filter_06h)
+    if (input$filter_24h != "All") data <- data %>% filter(bucket_24h == input$filter_24h)
+    
+    if (nzchar(input$text_search)) {
+      search_term <- tolower(input$text_search)
+      data <- data %>%
+        mutate(
+          is_match = rowSums(across(
+            c(Gene, operon, Product, COG, COG_def, COG_cat, KEGG_Module, KEGG_module_def),
+            ~ grepl(search_term, tolower(as.character(.x)), fixed = TRUE)
+          )) > 0
+        )
+    } else {
+      data <- data %>% mutate(is_match = TRUE)
+    }
+    data
+  })
+  
+  output$match_count <- renderText({
+    df <- processed_data()
+    if (!nzchar(input$text_search)) return("")
+    match_num <- sum(df$is_match)
+    paste0("Found ", match_num, " matching genes.")
+  })
+  
+  # Render the Highlighted Scatter Plot
+  output$scatter_plot <- renderPlot({
+    df <- processed_data()
+    
+    p <- ggplot(df, aes(x = model_LFC_06h, y = model_LFC_24h)) +
+      # Threshold dashed lines
+      geom_vline(xintercept = c(-1, -0.5, 0.5, 1), linetype = "dashed", color = "grey85") +
+      geom_hline(yintercept = c(-1, -0.5, 0.5, 1), linetype = "dashed", color = "grey85")
+    
+    if (nzchar(input$text_search)) {
+      p <- p + 
+        geom_point(data = filter(df, !is_match), color = "grey90", alpha = 0.3, size = 1.5) +
+        geom_point(data = filter(df, is_match), aes(color = bucket_06h), alpha = 0.9, size = 3) +
+        scale_color_brewer(palette = "Set1")
+    } else {
+      p <- p + 
+        geom_point(aes(color = bucket_06h), alpha = 0.6, size = 2) +
+        scale_color_brewer(palette = "Set1")
+    }
+    
+    p + theme_minimal() +
+      labs(
+        title = "Log2 Fold Change Coordinates (Housekeeping Filtered)",
+        x = "Log2 Fold Change (06h)",
+        y = "Log2 Fold Change (24h)",
+        color = "06h Group Structure"
+      ) +
+      theme(
+        legend.position = "bottom",
+        # Fixes the primary outer axes to solid bold black lines
+        axis.line = element_line(color = "black", size = 0.8),
+        axis.ticks = element_line(color = "black")
+      )
+  })
+  
+  # Dynamic Interactive Table
+  output$metadata_table <- renderDT({
+    df <- processed_data()
+    
+    if (nzchar(input$text_search)) {
+      df <- df %>% filter(is_match)
+    }
+    
+    coords <- input$plot_brush
+    if (!is.null(coords)) {
+      df <- brushedPoints(df, coords, xvar = "model_LFC_06h", yvar = "model_LFC_24h")
+    }
+    
+    display_df <- df %>%
+      select(
+        Gene, operon, Product, COG, COG_def, COG_cat, 
+        model_LFC_06h, padj_06h, model_LFC_24h, padj_24h,
+        KEGG_Module, KEGG_module_def
+      )
+    
+    datatable(
+      display_df,
+      options = list(pageLength = 5, scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+}
+
+# --- Launch ---
+shinyApp(ui = ui, server = server)
+```
+
+
+```{r}
+library(shiny)
+library(tidyverse)
+library(DT)
+
+# --- UI Layout ---
+ui <- fluidPage(
+  titlePanel("Interactive Gene Exploration: Text Search Highlighting"),
+  sidebarLayout(
+    sidebarPanel(
+      width = 3,
+      helpText("Instructions:"),
+      helpText("1. Type any keyword below (e.g., 'transporter', 'J', 'operon') to highlight matching genes on the plot."),
+      helpText("2. Click and drag a box (brush) on the plot to filter the table further to just those specific points."),
+      hr(),
+      
+      # Text Search Box
+      textInput("text_search", "Search Metadata (Case-Insensitive):", value = ""),
+      span(textOutput("match_count"), style = "font-weight: bold; color: #2c3e50;"),
+      
+      hr(),
+      selectInput("filter_06h", "Quick Filter 06h Bucket:", 
+                  choices = c("All", unique(df_binned$bucket_06h))),
+      selectInput("filter_24h", "Quick Filter 24h Bucket:", 
+                  choices = c("All", unique(df_binned$bucket_24h)))
+    ),
+    
+    mainPanel(
+      width = 9,
+      plotOutput("scatter_plot", brush = brushOpts(id = "plot_brush", resetOnNew = FALSE)),
+      br(),
+      h4("Selected/Highlighted Genes Functional Annotations"),
+      DTOutput("metadata_table")
+    )
+  )
+)
+
+# --- Server Logic ---
+server <- function(input, output, session) {
+  
+  # 1. Reactive dataset handling text searching AND dropdown filters
+  processed_data <- reactive({
+    data <- df_binned
+    
+    # Apply standard bucket filters first
+    if (input$filter_06h != "All") data <- data %>% filter(bucket_06h == input$filter_06h)
+    if (input$filter_24h != "All") data <- data %>% filter(bucket_24h == input$filter_24h)
+    
+    # Apply text searching across ALL key metadata columns simultaneously
+    if (nzchar(input$text_search)) {
+      search_term <- tolower(input$text_search)
+      
+      data <- data %>%
+        mutate(
+          is_match = rowSums(across(
+            c(Gene, operon, Product, COG, COG_def, COG_cat, KEGG_Module, KEGG_module_def),
+            ~ grepl(search_term, tolower(as.character(.x)), fixed = TRUE)
+          )) > 0
+        )
+    } else {
+      # If nothing is searched, default everything to a match (normal coloring)
+      data <- data %>% mutate(is_match = TRUE)
+    }
+    
+    data
+  })
+  
+  # Text indicator for how many genes match the search term
+  output$match_count <- renderText({
+    df <- processed_data()
+    if (!nzchar(input$text_search)) return("")
+    match_num <- sum(df$is_match)
+    paste0("Found ", match_num, " matching genes.")
+  })
+  
+  # 2. Render the Highlighted Scatter Plot
+  output$scatter_plot <- renderPlot({
+    df <- processed_data()
+    
+    # Base plot structure
+    p <- ggplot(df, aes(x = model_LFC_06h, y = model_LFC_24h)) +
+      geom_vline(xintercept = c(-1, -0.5, 0.5, 1), linetype = "dashed", color = "grey80") +
+      geom_hline(yintercept = c(-1, -0.5, 0.5, 1), linetype = "dashed", color = "grey80")
+    
+    # Plotting logic depends on whether user is searching
+    if (nzchar(input$text_search)) {
+      p <- p + 
+        # Background: Non-matching genes faded out completely
+        geom_point(data = filter(df, !is_match), color = "grey85", alpha = 0.4, size = 1.5) +
+        # Foreground: Matching genes colored brightly
+        geom_point(data = filter(df, is_match), aes(color = bucket_06h), alpha = 0.9, size = 3) +
+        scale_color_brewer(palette = "Set1")
+    } else {
+      # Default view when no text is being searched
+      p <- p + 
+        geom_point(aes(color = bucket_06h), alpha = 0.6, size = 2) +
+        scale_color_brewer(palette = "Set1")
+    }
+    
+    p + theme_minimal() +
+      labs(
+        title = "Log2 Fold Change Coordinates",
+        x = "Log2 Fold Change (06h)",
+        y = "Log2 Fold Change (24h)",
+        color = "06h Group Structure"
+      ) +
+      theme(legend.position = "bottom")
+  })
+  
+  # 3. Dynamic Interactive Table
+  output$metadata_table <- renderDT({
+    df <- processed_data()
+    
+    # If a text search is active, the table immediately narrows down to just matches
+    if (nzchar(input$text_search)) {
+      df <- df %>% filter(is_match)
+    }
+    
+    # If a click-and-drag box is drawn, subset the rows further by plot coordinates
+    coords <- input$plot_brush
+    if (!is.null(coords)) {
+      df <- brushedPoints(df, coords, xvar = "model_LFC_06h", yvar = "model_LFC_24h")
+    }
+    
+    display_df <- df %>%
+      select(
+        Gene, operon, Product, COG, COG_def, COG_cat, 
+        model_LFC_06h, padj_06h, model_LFC_24h, padj_24h,
+        KEGG_Module, KEGG_module_def
+      )
+    
+    datatable(
+      display_df,
+      options = list(pageLength = 5, scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+}
+
+# --- Launch ---
+shinyApp(ui = ui, server = server)
+```
+```{r}
+mahal_anno <- left_join(df_final_clusters, anno_operon_stats)
+
+
+# Your vector of terms
+housekeeping_terms <- c(
+  "\\b5s\\b", "\\b16s\\b", "\\b23s\\b",
+  "rrna",
+  "ribosomal protein",
+  "^ribosomal large subunit$",
+  "^ribosomal small subunit$",
+  "sigma factor", "rna polymerase"
+)
+
+# 1. Combine terms into a single regex pattern separated by '|'
+# We use case-insensitive matching (?i) just in case
+pattern <- paste0("(?i)", paste(housekeeping_terms, collapse = "|"))
+
+# 2. Filter out any rows where the pattern matches in ANY column
+# Filter rows based on all columns, then completely drop the GO_bak column
+filtered_mahal_anno <- mahal_anno %>%
+  filter(!if_any(everything(), ~ coalesce(str_detect(as.character(.x), pattern), FALSE))) %>%
+  select(-GO_bak) %>%
+  mutate(KEGG_Pathway = map_chr(str_split(KEGG_Pathway, ",\\s*"), function(x) {
+    # Drop elements starting with "ko" or "KO"
+    filtered <- x[!str_detect(x, "(?i)^ko")]
+    
+    # Re-assemble the remaining pieces back into a single string
+    paste(filtered, collapse = ", ")
+  }))
+
+head(filtered_mahal_anno)
+
+```
+
+```{r}
+library(shiny)
+library(dplyr)
+library(ggplot2)
+library(DT)
+
+# --- UI Layout ---
+ui <- fluidPage(
+  titlePanel("Interactive Gene Exploration: Cluster Analysis & Text Search"),
+  sidebarLayout(
+    sidebarPanel(
+      width = 3,
+      helpText("Instructions:"),
+      helpText("1. Type any keyword below (e.g., 'transporter', 'operon') to highlight matching genes on the plot."),
+      helpText("2. Click and drag a box (brush) on the plot to filter the table below to just those specific points."),
+      hr(),
+      
+      # Text Search Box
+      textInput("text_search", "Search Metadata (Case-Insensitive):", value = ""),
+      span(textOutput("match_count"), style = "font-weight: bold; color: #2c3e50;"),
+      
+      hr(),
+      # Quick filter by cluster selection dropdown
+      selectInput("filter_cluster", "Quick Filter by Cluster:", 
+                  choices = c("All", sort(unique(as.character(filtered_mahal_anno$cluster)))))
+    ),
+    
+    mainPanel(
+      width = 9,
+      plotOutput("scatter_plot", brush = brushOpts(id = "plot_brush", resetOnNew = FALSE)),
+      br(),
+      h4("Selected/Highlighted Genes Functional Annotations"),
+      DTOutput("metadata_table")
+    )
+  )
+)
+
+# --- Server Logic ---
+server <- function(input, output, session) {
+  
+  # 1. Reactive dataset handling text searching AND cluster filters
+  processed_data <- reactive({
+    data <- filtered_mahal_anno
+    
+    # Apply standard cluster dropdown filter first
+    if (input$filter_cluster != "All") {
+      data <- data %>% filter(cluster == input$filter_cluster)
+    }
+    
+    # Apply text searching across ALL key metadata columns simultaneously
+    if (nzchar(input$text_search)) {
+      search_term <- tolower(input$text_search)
+      
+      data <- data %>%
+        mutate(
+          is_match = rowSums(across(
+            # Adjust these column names if they differ in filtered_mahal_anno
+            c(Gene, operon, Product, COG, COG_def, COG_cat, KEGG_Module, KEGG_module_def),
+            ~ grepl(search_term, tolower(as.character(.x)), fixed = TRUE)
+          )) > 0
+        )
+    } else {
+      # If nothing is searched, default everything to a match (normal coloring)
+      data <- data %>% mutate(is_match = TRUE)
+    }
+    
+    data
+  })
+  
+  # Text indicator for how many genes match the search term
+  output$match_count <- renderText({
+    df <- processed_data()
+    if (!nzchar(input$text_search)) return("")
+    match_num <- sum(df$is_match)
+    paste0("Found ", match_num, " matching genes.")
+  })
+  
+  # 2. Render the Highlighted Scatter Plot (Color-coded by cluster)
+  output$scatter_plot <- renderPlot({
+    df <- processed_data()
+    
+    # Base plot structure using your LFC dimensions
+    p <- ggplot(df, aes(x = model_LFC_06h, y = model_LFC_24h)) +
+      geom_vline(xintercept = c(-1, -0.5, 0.5, 1), linetype = "dashed", color = "grey80") +
+      geom_hline(yintercept = c(-1, -0.5, 0.5, 1), linetype = "dashed", color = "grey80")
+    
+    # Plotting logic depends on whether user is searching
+    if (nzchar(input$text_search)) {
+      p <- p + 
+        # Background: Non-matching genes faded out completely
+        geom_point(data = filter(df, !is_match), color = "grey85", alpha = 0.3, size = 1.5) +
+        # Foreground: Matching genes brightly colored by CLUSTER
+        geom_point(data = filter(df, is_match), aes(color = as.factor(cluster)), alpha = 0.9, size = 3) +
+        scale_color_brewer(palette = "Set1")
+    } else {
+      # Default view when no text is being searched: Colored by CLUSTER
+      p <- p + 
+        geom_point(aes(color = as.factor(cluster)), alpha = 0.6, size = 2) +
+        scale_color_brewer(palette = "Set1")
+    }
+    
+    p + theme_minimal() +
+      labs(
+        title = "Log2 Fold Change Coordinates (Mahal Anno)",
+        x = "Log2 Fold Change (06h)",
+        y = "Log2 Fold Change (24h)",
+        color = "Cluster Assignment"
+      ) +
+      theme(legend.position = "bottom")
+  })
+  
+  # 3. Dynamic Interactive Table
+  output$metadata_table <- renderDT({
+    df <- processed_data()
+    
+    # If a text search is active, the table immediately narrows down to just matches
+    if (nzchar(input$text_search)) {
+      df <- df %>% filter(is_match)
+    }
+    
+    # If a click-and-drag box is drawn, subset the rows further by plot coordinates
+    coords <- input$plot_brush
+    if (!is.null(coords)) {
+      df <- brushedPoints(df, coords, xvar = "model_LFC_06h", yvar = "model_LFC_24h")
+    }
+    
+    # Organize columns for final view
+    display_df <- df %>%
+      select(
+        Gene, cluster, model_LFC_06h, model_LFC_24h, 
+        everything() # Keeps remaining metadata columns intact
+      )
+    
+    datatable(
+      display_df,
+      options = list(pageLength = 5, scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+}
+
+# --- Launch ---
+shinyApp(ui = ui, server = server)
+```
+
+```{r}
+library(shiny)
+library(shinythemes)
+library(dplyr)
+library(ggplot2)
+library(DT)
+
+# ==========================================
+# DEFINITION OF TIERED BIOLOGICAL PATHWAY REGEX
+# ==========================================
+filter_taxonomy <- list(
+  "Central Carbon (TCA/Pyruvate)" = "pyruvate|citrate|succinate|malate|fumarate|oxaloacetate|dehydrogenase|isocitrate|tca cycle|aconitase",
+  "CHCA & Aromatic Engine"         = "aldolase|hpch|hpai|icmf|mutase|cyclohexane|chca|degradation|benzoate|bena|catechol|cata|catb|muconate|carboxymuconate|protocatechuate|pca|hydroxybenzoate|dioxygenase|ketoadipate|pcad|pcai|pcaj|catc|catd|oxoadipate",
+  "Pimelyl-CoA & Biotin Shunt"     = "biotin|pimelate|pimelyl|bioa|biob|bioc|bioh|biod|biow|biotin synthase|oxononanoate",
+  "Aliphatic/Fatty Acid Eating"    = "alkane|alkb|rubredoxin|hydroxylase|fatty acid degradation|fad|enoyl-coa",
+  "PAH & Complex Hydrocarbons"     = "naphthalene|salicylate|sal|nah|toluene|xyl|benzene|styrene|ferredoxin",
+  "BCAA & Lipid Remodeling"        = "fab|acpp|leucine|isoleucine|valine|branched-chain|acyl-coa|thioesterase|plsy|carboxylase",
+  "Xenobiotic Resistance & Wall"   = "multidrug|resistance-nodulation-division|rnd|mara|mex|acr|beta-lactamase|bacitracin|vancomycin|tetracycline|aminoglycoside|penicillin-binding|peptidoglycan",
+  "Transporters & Permeases"       = "efflux|transporter|abc transporter|permease|secy|tata|porin|facilitator",
+  "Transcriptional Regulators"     = "paax|badr|regulator|repressor|two-component|sensor kinase|response regulator|marr|tetr|lysr",
+  "Stress Proteomics (Heat/ROS)"   = "heat shock|groel|groes|dnak|dnaj|clp|chaperone|catalase|peroxidase|superoxide|thioredoxin|glutathione",
+  "Translational Epigenetics"      = "pseudouridine|methyltransferase|wobble|miaa|trua|editing|rsoa|rsfa|silencing factor|aminoacyl-trna"
+)
+
+growth_artifacts_regex <- "initiation factor|elongation factor|if-1|if-2|ef-tu|ef-g|ef-ts|synthetase|ligase|ribosomal|alanine|trna-ala"
+
+# ==========================================
+# TOTAL RESET SANITIZATION BLOCK
+# ==========================================
+# 1. Force a standard data frame structure first
+raw_df <- as.data.frame(filtered_mahal_anno)
+
+# 2. Rebuild every column into a 100% flat, primitive base R vector
+clean_list <- lapply(raw_df, function(col) {
+  # If it's a factor, convert to character string first
+  if (is.factor(col)) {
+    col <- as.character(col)
+  }
+  # Violently wipe out all names, custom attributes, and package metadata classes
+  attributes(col) <- NULL
+  return(col)
+})
+
+# 3. Assemble the completely clean vectors back into an untainted dataframe
+clean_mahal_anno <- data.frame(clean_list, stringsAsFactors = FALSE, check.names = FALSE)
+
+
+# --- UI Layout ---
+ui <- fluidPage(
+  theme = shinytheme("cosmo"), 
+  titlePanel("Interactive Gene Exploration: Cluster Analysis & Functional Pathways"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      width = 3,
+      helpText(strong("Instructions:")),
+      helpText("1. Use the dropdown to immediately isolate specific biological pathways."),
+      helpText("2. Check the mask option to strip away growth-confounded noise."),
+      helpText("3. Type keywords to pinpoint specific elements, or highlight points via click-and-drag box (brush)."),
+      hr(),
+      
+      # 1. Biological Taxonomy Filter Dropdown
+      selectInput("pathway_filter", "Select Functional Layer:",
+                  choices = c("All Functional Classes", names(filter_taxonomy))),
+      
+      # 2. Confounding Variable Mask Checkbox
+      checkboxInput("hide_artifacts", "Mask Growth/Ribosomal Artifacts", value = TRUE),
+      helpText("Clears out the massive, growth-rate confounded elongation/initiation factor cloud."),
+      hr(),
+      
+      # Quick filter by cluster selection dropdown
+      selectInput("filter_cluster", "Quick Filter by Cluster:", 
+                  choices = c("All", sort(unique(as.character(clean_mahal_anno$cluster))))),
+      hr(),
+      
+      # Text Search Box
+      textInput("text_search", "Search Metadata (Case-Insensitive):", value = ""),
+      span(textOutput("match_count"), style = "font-weight: bold; color: #2c3e50;")
+    ),
+    
+    mainPanel(
+      width = 9,
+      plotOutput("scatter_plot", brush = brushOpts(id = "plot_brush", resetOnNew = FALSE)),
+      br(),
+      h4("Selected/Highlighted Genes Functional Annotations"),
+      DTOutput("metadata_table")
+    )
+  )
+)
+
+
+# --- Server Logic ---
+server <- function(input, output, session) {
+  
+  # 1. Reactive dataset handling text searching, cluster filters, and pathway regex layers
+  processed_data <- reactive({
+    data <- clean_mahal_anno
+    
+    meta_cols <- c(
+      "Gene", "operon", "Product", "is_driver",
+      "COG", "COG_def", "COG_cat", "COG_cat_def", 
+      "KO", "KO_def", "cant-hyd", 
+      "KEGG_Module", "KEGG_module_def", "KEGG_Pathway", "KEGG_path_def", "KEGG_Reaction", "KEGG_rclass"
+    )
+    meta_cols <- intersect(meta_cols, colnames(data))
+    
+    # A. Apply Growth Confounding Mask if selected (FIXED: across -> if_any)
+    if (input$hide_artifacts) {
+      data <- data %>%
+        filter(!if_any(any_of(meta_cols), ~ grepl(growth_artifacts_regex, as.character(.x), ignore.case = TRUE)))
+    }
+    
+    # B. Apply Standard Cluster Dropdown Filter
+    if (input$filter_cluster != "All") {
+      data <- data %>% filter(cluster == input$filter_cluster)
+    }
+    
+    # C. Apply Pathway Layer Selection Regex across all annotation vectors
+    if (input$pathway_filter != "All Functional Classes") {
+      pathway_regex <- filter_taxonomy[[input$pathway_filter]]
+      data <- data %>%
+        filter(rowSums(across(any_of(meta_cols), ~ grepl(pathway_regex, as.character(.x), ignore.case = TRUE))) > 0)
+    }
+    
+    # D. Apply Manual Text Search Highlighting across all metadata vectors
+    if (nzchar(input$text_search)) {
+      search_term <- tolower(input$text_search)
+      data <- data %>%
+        mutate(
+          is_match = rowSums(across(
+            any_of(meta_cols),
+            ~ grepl(search_term, tolower(as.character(.x)), fixed = TRUE)
+          )) > 0
+        )
+    } else {
+      data <- data %>% mutate(is_match = TRUE)
+    }
+    
+    data
+  })
+  
+  # Text indicator showing specific match hits
+  output$match_count <- renderText({
+    df <- processed_data()
+    if (!nzchar(input$text_search)) return("")
+    match_num <- sum(df$is_match)
+    paste0("Found ", match_num, " matching genes.")
+  })
+  
+# 2. Render the Highlighted Scatter Plot (Color-coded by cluster)
+  output$scatter_plot <- renderPlot({
+    df <- processed_data()
+    
+    p <- ggplot(df, aes(x = model_LFC_06h, y = model_LFC_24h)) +
+      # Subdued background grid lines for secondary thresholds
+      geom_vline(xintercept = c(-1, -0.5, 0.5, 1), linetype = "dashed", color = "grey85") +
+      geom_hline(yintercept = c(-1, -0.5, 0.5, 1), linetype = "dashed", color = "grey85") +
+      # Bold, black central axes to clearly define the 4 quadrants
+      geom_vline(xintercept = 0, color = "black", linewidth = 0.8) +
+      geom_hline(yintercept = 0, color = "black", linewidth = 0.8)
+    
+    if (nzchar(input$text_search)) {
+      p <- p + 
+        geom_point(data = filter(df, !is_match), color = "grey85", alpha = 0.3, size = 1.5) +
+        geom_point(data = filter(df, is_match), aes(color = as.factor(cluster)), alpha = 0.9, size = 3) +
+        scale_color_brewer(palette = "Set1")
+    } else {
+      p <- p + 
+        geom_point(aes(color = as.factor(cluster)), alpha = 0.6, size = 2) +
+        scale_color_brewer(palette = "Set1")
+    }
+    
+    p + theme_minimal(base_size = 13) +
+      labs(
+        title = paste("Transcriptional Coordination Matrix:", input$pathway_filter),
+        x = "Log2 Fold Change (06h Acute Kinetic Phase)",
+        y = "Log2 Fold Change (24h Chronic Steady-State)",
+        color = "Cluster Assignment"
+      ) +
+      theme(
+        legend.position = "bottom",
+        plot.title = element_text(face = "bold", color = "#2c3e50")
+      )
+  })
+  
+  # 3. Dynamic Interactive Table
+  output$metadata_table <- renderDT({
+    df <- processed_data()
+    
+    if (nzchar(input$text_search)) {
+      df <- df %>% filter(is_match)
+    }
+    
+    coords <- input$plot_brush
+    if (!is.null(coords)) {
+      df <- brushedPoints(df, coords, xvar = "model_LFC_06h", yvar = "model_LFC_24h")
+    }
+    
+    # Safely strip our transient logical query flag
+    display_df <- df %>% select(-any_of("is_match"))
+    
+    # Organize column structure neatly for the viewer
+    primary_cols <- intersect(c("Gene", "cluster", "model_LFC_06h", "model_LFC_24h", "Product", "membership_score"), colnames(display_df))
+    extra_cols   = setdiff(colnames(display_df), primary_cols)
+    display_df   <- display_df %>% select(all_of(primary_cols), all_of(extra_cols))
+    
+    # EMERGENCY FAILSALFE: Explicitly force every column to be a simple primitive vector 
+    # This prevents complex data types from reaching JSON serialization
+    display_df <- as.data.frame(lapply(display_df, function(x) {
+      if (is.list(x)) return(sapply(x, toString))
+      return(x)
+    }), stringsAsFactors = FALSE)
+    
+    datatable(
+      display_df,
+      options = list(
+        pageLength = 5, 
+        scrollX = TRUE,
+        searchHighlight = TRUE
+      ),
+      rownames = FALSE,
+      filter = "top"
+    ) %>%
+      formatRound(columns = intersect(c("model_LFC_06h", "model_LFC_24h", "membership_score", "mahalanobis_dist"), colnames(display_df)), digits = 2)
+  })
+}
+
+# --- Launch Engine ---
+shinyApp(ui = ui, server = server)
+```
+```{r}
+
+cant_hyde <- filtered_mahal_anno %>%
+  distinct(`cant-hyd`)
+view(cant_hyde)
+```
+
+
+```{r}
+library(shiny)
+library(shinythemes)
+library(dplyr)
+library(ggplot2)
+library(DT)
+
+# ==========================================
+# DEFINITION OF TIERED BIOLOGICAL PATHWAY REGEX
+# ==========================================
+filter_taxonomy <- list(
+  "Central Carbon (TCA/Pyruvate)" = "pyruvate|citrate|succinate|malate|fumarate|oxaloacetate|dehydrogenase|isocitrate|tca cycle|aconitase",
+  "CHCA Saturated Ring Degradation" = "cyclohexane|chca|ali-coa|degradation|cyclohexanecarboxyl|badA|badI|badR|ring-cleavage|aldolase|hpch|hpai|icmf|mutase",
+  "Pimelyl-CoA & Biotin Shunt"     = "biotin|pimelate|pimelyl|bioa|biob|bioc|bioh|biod|biow|biotin synthase|oxononanoate|bioy|bioi",
+  "Aliphatic/Fatty Acid Eating"    = "alkane|alkb|rubredoxin|hydroxylase|fatty acid degradation|fad|enoyl-coa",
+  "PAH & Complex Hydrocarbons"     = "naphthalene|salicylate|sal|nah|toluene|xyl|benzene|styrene|ferredoxin",
+  "CANT HYDE"                      = "AhyA|AlkB|AlmA_GroupI|AlmA_GroupIII|CYP153|DszC|LadA_alpha|LadB|NdoB|non_NdoB_type|TomA1",
+"Cyclic Amino Acids & Osmoprotection" = "\\bproline\\b|\\bhydroxyproline\\b|\\bputA\\b|\\bputP\\b|\\bproA\\b|\\bproB\\b|\\bproC\\b|\\bproV\\b|\\bproW\\b|\\bproX\\b|\\bshikimate\\b|\\bchorismate\\b|\\bprephenate\\b|\\bphenylalanine\\b|\\btyrosine\\b|\\btryptophan\\b|\\baroG\\b|\\baroF\\b|\\baroH\\b|\\bopuu\\b",
+  "BCAA & Lipid Remodeling"        = "fab|acpp|leucine|isoleucine|valine|branched-chain|acyl-coa|thioesterase|plsy|carboxylase",
+  "Membrane Fluidity & Adaptation" = "desaturase|desA|des|fatty acid desaturase|cls|cardiolipin synthase|lipid bilayer stability",
+  "Gram-Pos Cell Wall & Envelope"  = "mprf|dltA|dltB|dltC|dltD|liaR|liaS|peptidoglycan|teichoic acid|penicillin-binding|cell wall stress|bacitracin|vancomycin",
+  "Transporters & MFS Pumps"       = "efflux|transporter|abc transporter|permease|secy|tata|porin|facilitator|major facilitator superfamily|mfs",
+  "Transcriptional Regulators"     = "paax|badr|regulator|repressor|two-component|sensor kinase|response regulator|marr|tetr|lysr",
+  "SigB General Stress Response"   = "sigB|rsbV|rsbW|rsbX|rsbU|rsbT|general stress protein|gsiB",
+  "Protein folding & ROS Distress" = "heat shock|groel|groes|dnak|dnaj|clp|chaperone|catalase|peroxidase|superoxide|thioredoxin|glutathione",
+  "Metal Homeostasis & Fe-S"       = "siderophore|fur regulator|ferric uptake|dhbA|dhbB|dhbC|iscu|iron-sulfur cluster assembly|bacillibactin",
+  "Endospore & Sporulation"        = "spo0A|spoII|spoIII|spoIV|spoV|sigE|sigF|sigG|sigK|small acid-soluble spore protein|sassp|gerA|germination",
+  "Translational Epigenetics"      = "pseudouridine|methyltransferase|wobble|miaa|trua|editing|rsoa|rsfa|silencing factor|aminoacyl-trna"
+)
+
+growth_artifacts_regex <- "initiation factor|elongation factor|if-1|if-2|ef-tu|ef-g|ef-ts|synthetase|ligase|ribosomal|alanine|trna-ala"
+
+# ==========================================
+# TOTAL RESET SANITIZATION BLOCK
+# ==========================================
+# 1. Force a standard data frame structure first
+raw_df <- as.data.frame(filtered_mahal_anno)
+
+# 2. Rebuild every column into a 100% flat, primitive base R vector
+clean_list <- lapply(raw_df, function(col) {
+  # If it's a factor, convert to character string first
+  if (is.factor(col)) {
+    col <- as.character(col)
+  }
+  # Violently wipe out all names, custom attributes, and package metadata classes
+  attributes(col) <- NULL
+  return(col)
+})
+
+# 3. Assemble the completely clean vectors back into an untainted dataframe
+clean_mahal_anno <- data.frame(clean_list, stringsAsFactors = FALSE, check.names = FALSE)
+
+
+# --- UI Layout ---
+ui <- fluidPage(
+  theme = shinytheme("cosmo"), 
+  titlePanel("Interactive Gene Exploration: Cluster Analysis & Functional Pathways"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      width = 3,
+      helpText(strong("Instructions:")),
+      helpText("1. Use the dropdown to immediately isolate specific biological pathways."),
+      helpText("2. Check the mask option to strip away growth-confounded noise."),
+      helpText("3. Type keywords to pinpoint specific elements, or highlight points via click-and-drag box (brush)."),
+      hr(),
+      
+      # 1. Biological Taxonomy Filter Dropdown
+      selectInput("pathway_filter", "Select Functional Layer:",
+                  choices = c("All Functional Classes", names(filter_taxonomy))),
+      
+      # 2. Confounding Variable Mask Checkbox
+      checkboxInput("hide_artifacts", "Mask Growth/Ribosomal Artifacts", value = TRUE),
+      helpText("Clears out the massive, growth-rate confounded elongation/initiation factor cloud."),
+      hr(),
+      
+      # Quick filter by cluster selection dropdown
+      selectInput("filter_cluster", "Quick Filter by Cluster:", 
+                  choices = c("All", sort(unique(as.character(clean_mahal_anno$cluster))))),
+      hr(),
+      
+      # Text Search Box
+      textInput("text_search", "Search Metadata (Case-Insensitive):", value = ""),
+      span(textOutput("match_count"), style = "font-weight: bold; color: #2c3e50;")
+    ),
+    
+    mainPanel(
+      width = 9,
+      plotOutput("scatter_plot", brush = brushOpts(id = "plot_brush", resetOnNew = FALSE)),
+      br(),
+      h4("Selected/Highlighted Genes Functional Annotations"),
+      DTOutput("metadata_table")
+    )
+  )
+)
+
+
+server <- function(input, output, session) {
+  
+  # 1. Reactive dataset handling text searching, cluster filters, and pathway regex layers
+  processed_data <- reactive({
+    data <- clean_mahal_anno
+    
+    meta_cols <- c(
+      "Gene", "operon", "Product", "is_driver",
+      "COG", "COG_def", "COG_cat", "COG_cat_def", 
+      "KO", "KO_def", "cant-hyd", 
+      "KEGG_Module", "KEGG_module_def", "KEGG_Pathway", "KEGG_path_def", "KEGG_Reaction", "KEGG_rclass"
+    )
+    meta_cols <- intersect(meta_cols, colnames(data))
+    
+    # A. Apply Growth Confounding Mask if selected
+    if (input$hide_artifacts) {
+      data <- data %>%
+        filter(!if_any(any_of(meta_cols), ~ grepl(growth_artifacts_regex, as.character(.x), ignore.case = TRUE)))
+    }
+    
+    # B. Apply Standard Cluster Dropdown Filter
+    if (input$filter_cluster != "All") {
+      data <- data %>% filter(cluster == input$filter_cluster)
+    }
+    
+    # C. NEW: Evaluate Pathway Layer Selection Regex without discarding non-matches
+    if (input$pathway_filter != "All Functional Classes") {
+      pathway_regex <- filter_taxonomy[[input$pathway_filter]]
+      data <- data %>%
+        mutate(
+          is_pathway_match = rowSums(across(any_of(meta_cols), ~ grepl(pathway_regex, as.character(.x), ignore.case = TRUE))) > 0
+        )
+    } else {
+      data <- data %>% mutate(is_pathway_match = TRUE)
+    }
+    
+    # D. Apply Manual Text Search Highlighting across all metadata vectors
+    if (nzchar(input$text_search)) {
+      search_term <- tolower(input$text_search)
+      data <- data %>%
+        mutate(
+          is_match = rowSums(across(
+            any_of(meta_cols),
+            ~ grepl(search_term, tolower(as.character(.x)), fixed = TRUE)
+          )) > 0
+        )
+    } else {
+      data <- data %>% mutate(is_match = TRUE)
+    }
+    
+    data
+  })
+  
+  # Text indicator showing specific match hits (counting active dropdown + text matches)
+  output$match_count <- renderText({
+    df <- processed_data()
+    if (!nzchar(input$text_search)) return("")
+    match_num <- sum(df$is_match & df$is_pathway_match)
+    paste0("Found ", match_num, " matching genes.")
+  })
+  
+  # 2. Render the Highlighted Scatter Plot (with background gene cloud)
+  output$scatter_plot <- renderPlot({
+    df <- processed_data()
+    
+    # Split the data into background cloud and foreground points
+    bg_cloud   <- filter(df, !is_pathway_match | !is_match)
+    fg_visible <- filter(df, is_pathway_match & is_match)
+    
+    p <- ggplot(df, aes(x = model_LFC_06h, y = model_LFC_24h)) +
+      # Secondary threshold lines
+      geom_vline(xintercept = c(-1, -0.5, 0.5, 1), linetype = "dashed", color = "grey85") +
+      geom_hline(yintercept = c(-1, -0.5, 0.5, 1), linetype = "dashed", color = "grey85") +
+      # Bold black quadrant crosshairs
+      geom_vline(xintercept = 0, color = "black", linewidth = 0.8) +
+      geom_hline(yintercept = 0, color = "black", linewidth = 0.8) +
+      
+      # LAYER 1: The background gene cloud (very light grey, smaller size)
+      geom_point(data = bg_cloud, color = "grey92", alpha = 0.4, size = 1.2) +
+      
+      # LAYER 2: The foreground highlighted points (color-coded by cluster)
+      geom_point(data = fg_visible, aes(color = as.factor(cluster)), alpha = 0.9, size = 2.5) +
+      scale_color_brewer(palette = "Set1")
+    
+    p + theme_minimal(base_size = 13) +
+      labs(
+        title = paste("Transcriptional Coordination Matrix:", input$pathway_filter),
+        x = "Log2 Fold Change (06h Acute Kinetic Phase)",
+        y = "Log2 Fold Change (24h Chronic Steady-State)",
+        color = "Cluster Assignment"
+      ) +
+      theme(
+        legend.position = "bottom",
+        plot.title = element_text(face = "bold", color = "#2c3e50")
+      )
+  })
+  
+  # 3. Dynamic Interactive Table
+  output$metadata_table <- renderDT({
+    df <- processed_data()
+    
+    # Table only displays the fully matching foreground items
+    df <- df %>% filter(is_pathway_match & is_match)
+    
+    coords <- input$plot_brush
+    if (!is.null(coords)) {
+      df <- brushedPoints(df, coords, xvar = "model_LFC_06h", yvar = "model_LFC_24h")
+    }
+    
+    # Safely strip our transient logical query flags
+    display_df <- df %>% select(-any_of(c("is_match", "is_pathway_match")))
+    
+    # Organize column structure neatly for the viewer
+    primary_cols <- intersect(c("Gene", "cluster", "model_LFC_06h", "model_LFC_24h", "Product", "membership_score"), colnames(display_df))
+    extra_cols   = setdiff(colnames(display_df), primary_cols)
+    display_df   <- display_df %>% select(all_of(primary_cols), all_of(extra_cols))
+    
+    # EMERGENCY FAILSAFE: Explicitly force every column to be a simple primitive vector
+    display_df <- as.data.frame(lapply(display_df, function(x) {
+      if (is.list(x)) return(sapply(x, toString))
+      return(x)
+    }), stringsAsFactors = FALSE)
+    
+    datatable(
+      display_df,
+      options = list(
+        pageLength = 5, 
+        scrollX = TRUE,
+        searchHighlight = TRUE
+      ),
+      rownames = FALSE,
+      filter = "top"
+    ) %>%
+      formatRound(columns = intersect(c("model_LFC_06h", "model_LFC_24h", "membership_score", "mahalanobis_dist"), colnames(display_df)), digits = 2)
+  })
+}
+
+# --- Launch Engine ---
+shinyApp(ui = ui, server = server)
+```
+
+
+
+```{r}
+library(tidyverse)
+library(ComplexUpset)
+library(ggplot2)
+library(Polychrome)
+
+# 1. Get all unique COG categories present in your cleaned data
+unique_cogs <- sort(unique(df_plot_split_dedup$COG_cat_clean))
+num_colors <- length(unique_cogs) # This is 25 in your data
+
+# 2. Use alphabet.colors() which supports up to 26 colors natively
+set.seed(42)
+cog_palette <- Polychrome::alphabet.colors(num_colors)
+names(cog_palette) <- unique_cogs
+
+# Explicitly force "Unknown" to be light grey so it doesn't steal a bright color
+if("Unknown" %in% names(cog_palette)) {
+  cog_palette["Unknown"] <- "#D3D3D3"
+}
+
+# 3. Plot using the fixed manual color scale
+ComplexUpset::upset(
+  data = df_plot_split_dedup,
+  intersect = as.character(all_sets),
+  min_size = 5,
+  width_ratio = 0.2,
+  wrap = TRUE,
+  base_annotations = list(
+    'Intersection size' = (
+      ComplexUpset::intersection_size(
+        counts = TRUE,
+        mapping = ggplot2::aes(fill = COG_cat_clean)
+      ) 
+      + ggplot2::scale_fill_manual(values = cog_palette)
+    )
+  )
+) + ggplot2::labs(
+  title = "Regulation Groups by Split/Deduplicated COG Category",
+  fill = "COG Category"
+)
+```
+
+
+

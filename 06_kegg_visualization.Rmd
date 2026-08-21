@@ -1,0 +1,1372 @@
+---
+title: "06_kegg_visualization"
+author: "Kira Goff"
+date: "2026-06-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pathview)
+library(scales) 
+```
+
+
+```{r}
+results_in <- "./results/05-mahalanobis-distance"
+results_out <- "./results/06-enrichment-vis-test"
+if (!dir.exists(results_out)) {
+  dir.create(results_out, recursive = TRUE)
+}
+```
+
+KEGG type   lookup col
+Module      Parent_Pathways
+Pathway     Pathway_Class
+
+# Module Mapping
+
+```{r}
+# --- variables and naming ---
+input_file <- "./results/05-mahalanobis-distance/KEGG_Pathway_enrichment_mahal4.0_lfc0.50_q0.1_nterms37_ngenes130.tsv"
+lookup_col <- "Pathway_Class"
+data_table <- read.delim(input_file)
+intype <- "Pathway"
+
+show_category <- nrow(data_table)  # plot all categories (nrow(data_table)) or top x
+sort_category <- "ID" # Options: "GeneRatio_numeric", "qvalue", "Count", "ID" (KO)
+
+just_the_filename <- basename(input_file)
+file_prefix <- tools::file_path_sans_ext(just_the_filename)
+
+# Truncate the prefix so it stops right before "_nterms"
+clean_prefix <- sub("_nterms.*", "", file_prefix)
+
+# Output name now uses the truncated clean prefix
+output_plot_name <- paste0(clean_prefix, "--", sort_category,"--top_", show_category, "--dotplot.png")
+
+# --- data preparation ---
+# Load the data
+enrich_df <- read.delim(input_file, sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+
+# Convert GeneRatio from a fraction string to numeric
+if (is.character(enrich_df$GeneRatio)) {
+  enrich_df$GeneRatio_numeric <- sapply(enrich_df$GeneRatio, function(x) {
+    parts <- as.numeric(strsplit(x, "/")[[1]])
+    return(parts[1] / parts[2])
+  })
+} else {
+  enrich_df$GeneRatio_numeric <- enrich_df$GeneRatio
+}
+
+# Combine KO ID and Description (e.g., "ko00010: Glycolysis / Gluconeogenesis")
+enrich_df <- enrich_df %>%
+  mutate(ID_Description = paste0(ID, ": ", Description))
+
+plot_data <- enrich_df %>%
+  arrange(qvalue) %>%                    
+  head(show_category) %>% # FIX 1: Fixed variable name spelling       
+  # FIX 2: Used .data[[ ]] to safely allow dynamic string sorting
+  mutate(ID_Description = reorder(ID_Description, .data[[sort_category]]))
+
+# --- plot and export ---
+dot_plot <- ggplot(plot_data, aes(x = GeneRatio_numeric, y = ID_Description)) +
+  geom_point(aes(size = Count, color = qvalue)) + 
+  scale_color_gradient(low = "red", high = "blue", name = "q-value") +
+  scale_size_continuous(name = "Gene Count") +
+  labs(
+    x = "Gene Ratio",
+    y = paste0("KEGG ", intype," Term"),
+    title = paste0("KEGG ", intype," Enrichment Analysis"),
+    subtitle = paste("Source:", just_the_filename)
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.y = element_text(size = 8), # Sightly smaller font for 42 terms
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 8, color = "darkgray", hjust = 0.5)
+  )
+
+# FIX 3: Dynamically adjust height. 42 terms needs more vertical room than 20 terms!
+calculated_height <- max(5, show_category * 0.22)
+
+# Save the plot dynamically
+ggsave(filename = file.path(results_out, output_plot_name), 
+       plot = dot_plot, 
+       width = 9, 
+       height = calculated_height, 
+       dpi = 300)
+
+message("Success! Plot saved as: ", file.path(results_out, output_plot_name))
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+# 1. Parse, extract terms, and calculate unique gene counts per pathway
+pathway_frequency_table <- enrich_df %>%
+  # Remove any rows where the column in lookup_col is NA
+  filter(!is.na(.data[[lookup_col]])) %>%
+  
+  # Split the combined string pipe (" | ") into separate rows
+  # Note: separate_rows() accepts across() or all_of() in newer tidyr versions
+  separate_rows(all_of(lookup_col), sep = " \\| ") %>%
+  
+  # Trim any accidental whitespace
+  mutate(across(all_of(lookup_col), trimws)) %>%
+  
+  # Separate the Map ID from its text description
+  # separate() requires !!sym() to evaluate a string variable as a bare column name
+  separate(!!sym(lookup_col), into = c("Pathway_ID", "Pathway_Description"), 
+           sep = ": ", extra = "merge", fill = "right") %>%
+  
+  # Separate the slash-delimited genes into individual rows to handle overlaps perfectly
+  separate_rows(geneID, sep = "/") %>%
+  
+  # Group by the pathway to calculate summaries
+  group_by(Pathway_ID, Pathway_Description) %>%
+  summarise(
+    Frequency = n_distinct(ID), 
+    Gene_Count = n_distinct(geneID),
+    .groups = "drop"
+  ) %>%
+  
+  # --- UPDATED SORTING ---
+  arrange(desc(Frequency), desc(Gene_Count))
+
+# 2. View the resulting table in RStudio
+print(pathway_frequency_table)
+```
+
+# Start here
+
+# Visualize lookup_col with genes in enrichment analysis
+
+```{r setup-target-pathway}
+target_pathway <- "Metabolism; Lipid Metabolism" 
+
+# 2. Extract all rows from your enrichment data matching this pathway
+pathway_rows <- enrich_df %>%
+  # Use .data[[lookup_col]] to reference the column name stored in the variable
+  filter(grepl(target_pathway, .data[[lookup_col]]))
+
+# 3. Parse and unlist all the gene IDs associated with this pathway
+target_genes <- pathway_rows$geneID %>%
+  strsplit("/") %>%
+  unlist() %>%
+  unique()
+
+# 4. Filter your differential expression data for just these pathway genes
+pathway_expression <- df_final_clusters %>%
+  filter(Gene %in% target_genes) %>%
+  select(Gene, model_LFC_06h, model_LFC_24h)
+
+# View the extracted data to make sure it populated correctly
+#print(head(pathway_expression))
+# Optional: Un-comment the line below if you want to write this out as a clean TSV summary
+# write.table(pathway_frequency_table, file = file.path(results_out, paste0(clean_prefix, "_pathway_frequencies.tsv")), sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+
+```{r heatmap-and-pathway-map}
+# --- heat maps, non-operon ---
+# 1. Dynamically find the descriptive name of our target pathway
+pathway_desc <- enrich_df %>%
+  # Select using all_of() for string variables
+  select(all_of(lookup_col)) %>%
+  filter(!is.na(.data[[lookup_col]])) %>%
+  separate_rows(all_of(lookup_col), sep = " \\| ") %>%
+  mutate(across(all_of(lookup_col), trimws)) %>%
+  filter(grepl(target_pathway, .data[[lookup_col]])) %>%
+  distinct() %>%
+  pull(!!sym(lookup_col)) %>%  # Pull needs a symbol if using Tidyverse evaluation
+  sub(".*?: ", "", .) %>% 
+  head(1) 
+
+if(length(pathway_desc) == 0 || pathway_desc == "") {
+  pathway_desc <- target_pathway
+}
+
+# 2. Dynamically name the heatmap output file using the clean name
+clean_desc_slug <- gsub("[^a-zA-Z0-9]", "_", tolower(pathway_desc))
+clean_desc_slug <- gsub("_+", "_", clean_desc_slug) 
+output_heatmap_name <- paste0(clean_prefix, "__", target_pathway, "__", clean_desc_slug, "__heatmap.png")
+
+# 3. Build mapping of Gene to KO(s)
+gene_to_ko_mapping <- enrich_df %>%
+  filter(grepl(target_pathway, .data[[lookup_col]])) %>% # Fixed evaluation here
+  select(ID, geneID) %>%
+  separate_rows(geneID, sep = "/") %>%
+  group_by(geneID) %>%
+  summarize(KOs = paste(unique(ID), collapse = "/"), .groups = "drop")
+
+# 4. Extract the numeric suffix from the Gene ID and sort by it
+ordered_expression <- pathway_expression %>%
+  left_join(gene_to_ko_mapping, by = c("Gene" = "geneID")) %>%
+  mutate(Gene_Num = as.numeric(gsub("[^0-9]", "", Gene))) %>%
+  arrange(Gene_Num)
+
+# 5. Inject invisible spacer rows where the numeric gap > 5
+spaced_expression <- list()
+counter <- 1
+
+for(i in 1:nrow(ordered_expression)) {
+  spaced_expression[[counter]] <- ordered_expression[i, ]
+  counter <- counter + 1
+  
+  if(i < nrow(ordered_expression)) {
+    current_num <- ordered_expression$Gene_Num[i]
+    next_num    <- ordered_expression$Gene_Num[i + 1]
+    
+    if((next_num - current_num) > 5) {
+      spacer_row <- data.frame(
+        Gene = paste0("SPACER_", current_num), 
+        model_LFC_06h = NA,
+        model_LFC_24h = NA,
+        KOs = "",
+        Gene_Num = current_num + 1
+      )
+      spaced_expression[[counter]] <- spacer_row
+      counter <- counter + 1
+    }
+  }
+}
+
+final_spaced_df <- do.call(rbind, spaced_expression)
+
+# 6. Format labels (KEEPING SPACERS UNIQUE) and pivot to long format
+heatmap_data <- final_spaced_df %>%
+  mutate(
+    Gene_KO_Label = ifelse(grepl("SPACER", Gene), Gene, paste0(Gene, " (", KOs, ")"))
+  ) %>%
+  pivot_longer(
+    cols = c(model_LFC_06h, model_LFC_24h),
+    names_to = "Timepoint",
+    values_to = "LFC"
+  ) %>%
+  mutate(Timepoint = sub("model_LFC_", "", Timepoint))
+
+heatmap_data$Gene_KO_Label <- factor(heatmap_data$Gene_KO_Label, levels = unique(heatmap_data$Gene_KO_Label))
+
+# 7. GENERATE DYNAMIC HEATMAP PLOT
+pathway_map <- ggplot(heatmap_data, aes(x = Timepoint, y = Gene_KO_Label, fill = LFC)) +
+  geom_tile(color = "white", lwd = 0.3) +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red", 
+    midpoint = 0, name = "log2 FC", na.value = "transparent" 
+  ) +
+  scale_y_discrete(labels = function(x) ifelse(grepl("SPACER", x), "", x)) +
+  labs(
+    x = "Timepoint", 
+    y = paste0("Genes (KEGG ", intype,")"),
+    title = pathway_desc, 
+    subtitle = paste("Pathway ID:", target_pathway, "| Source:", just_the_filename)
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.y = element_text(size = 7, family = "mono"),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 12),
+    plot.subtitle = element_text(size = 8, color = "darkgray", hjust = 0.5),
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank()
+  )
+
+calc_heatmap_height <- max(4, nrow(final_spaced_df) * 0.22)
+
+ggsave(
+  filename = file.path(results_out, output_heatmap_name), 
+  plot = pathway_map, width = 6.5, height = calc_heatmap_height, dpi = 300
+)
+
+message("Success! Spaced heatmap with automated title saved as: ", file.path(results_out, output_heatmap_name))
+```
+
+
+# Visualize operon of genes in lookup_col
+
+```{r}
+# 1. Clean up the CSV inputs directly as they are read
+static_06h_exp <- read.csv("results/res_06h_exposure.csv") %>%
+  select(Gene = gene_id, model_LFC_06h = log2FoldChange, padj_06h = padj)
+
+static_24h_exp <- read.csv("results/res_24h_exposure.csv") %>%
+  select(Gene = gene_id, model_LFC_24h = log2FoldChange, padj_24h = padj)
+
+
+# 2. Clean up the matrix/DESeq objects using position-based selection
+static_exp <- res_exposure %>%
+  as.data.frame() %>%               
+  rownames_to_column(var = "Gene") %>%
+  select(Gene, padj_exp = padj)
+
+static_interaction <- res_interaction %>%
+  as.data.frame() %>%               
+  rownames_to_column(var = "Gene") %>%
+  select(Gene, padj_int = padj)
+
+
+# 3. Consolidate everything into a single, clean join pipeline
+anno_operon_stats <- anno_operon_clean %>%
+  left_join(static_06h_exp,      by = "Gene") %>%
+  left_join(static_24h_exp,      by = "Gene") %>%
+  left_join(static_exp,          by = "Gene") %>%
+  left_join(static_interaction,  by = "Gene")
+
+# Optional prints if you still need to inspect them in your notebook
+print(static_06h_exp)
+print(static_24h_exp)
+```
+
+
+
+```{r extract-operons}
+# target_pathway <- "map00280" 
+
+# 2. Extract all rows from your enrichment data matching this pathway
+pathway_rows <- enrich_df %>%
+  # FIX: Dynamically look up the column name stored inside the lookup_col variable
+  filter(grepl(target_pathway, .data[[lookup_col]]))
+
+# 3. Parse and unlist all the core gene IDs associated with this pathway
+pathway_genes <- pathway_rows$geneID %>%
+  strsplit("/") %>%
+  unlist() %>%
+  unique()
+
+# --- OPERON EXPANSION VIA ANNO_OPERON_STATS ---
+# Find which operons contain your pathway genes
+target_operons <- anno_operon_stats %>%
+  filter(Gene %in% pathway_genes) %>%
+  filter(!is.na(operon) & operon != "") %>% # Avoid pulling blank or unassigned operons
+  pull(operon) %>%
+  unique()
+
+# Pull all genes in those operons + carry through expression data
+pathway_expression <- anno_operon_stats %>%
+  filter(operon %in% target_operons | Gene %in% pathway_genes) %>%
+  select(Gene, model_LFC_06h, model_LFC_24h) %>%
+  distinct() # Safety fallback to prevent duplicate rows
+
+# View the extracted data layout
+print(head(pathway_expression))
+```
+
+
+```{r}
+# --- spaced heatmap with full operons ---
+
+# 1. Dynamically find the descriptive name of our target pathway
+pathway_desc <- enrich_df %>%
+  # FIX: use all_of() and .data[[]] for dynamic string variable evaluation
+  select(all_of(lookup_col)) %>%
+  filter(!is.na(.data[[lookup_col]])) %>%
+  separate_rows(all_of(lookup_col), sep = " \\| ") %>%
+  mutate(across(all_of(lookup_col), trimws)) %>%
+  filter(grepl(target_pathway, .data[[lookup_col]])) %>%
+  distinct() %>%
+  pull(!!sym(lookup_col)) %>%  # FIX: turn string variable into symbol to pull properly
+  sub(".*?: ", "", .) %>% 
+  head(1) 
+
+if(length(pathway_desc) == 0 || pathway_desc == "") {
+  pathway_desc <- target_pathway
+}
+
+# 2. Dynamically name the heatmap output file using the clean slug
+clean_desc_slug <- gsub("[^a-zA-Z0-9]", "_", tolower(pathway_desc))
+clean_desc_slug <- gsub("_+", "_", clean_desc_slug) 
+output_heatmap_name <- paste0(clean_prefix, "__", target_pathway, "__operons__", clean_desc_slug, "__heatmap.png")
+
+# 3. Build mapping of Gene to KO(s) strictly from the core enrichment data
+gene_to_ko_mapping <- enrich_df %>%
+  filter(grepl(target_pathway, .data[[lookup_col]])) %>% # FIX: evaluate lookup_col
+  select(ID, geneID) %>%
+  separate_rows(geneID, sep = "/") %>%
+  group_by(geneID) %>%
+  summarize(KOs = paste(unique(ID), collapse = "/"), .groups = "drop")
+
+# 4. Extract numeric suffix, attach enrichment mapping, and bring in native KO data
+ordered_expression <- pathway_expression %>%
+  left_join(gene_to_ko_mapping, by = c("Gene" = "geneID")) %>%
+  # Bring in the native KO column directly from your master stats frame
+  left_join(select(anno_operon_stats, Gene, KO), by = "Gene") %>%
+  distinct() %>% 
+  mutate(Gene_Num = as.numeric(gsub("[^0-9]", "", Gene))) %>%
+  arrange(Gene_Num)
+
+# 5. Inject invisible spacer rows where the numeric locus gap > 5
+spaced_expression <- list()
+counter <- 1
+
+for(i in 1:nrow(ordered_expression)) {
+  # Add the actual gene row
+  spaced_expression[[counter]] <- ordered_expression[i, ]
+  counter <- counter + 1
+  
+  # If there's a next row, check the distance between their IDs
+  if(i < nrow(ordered_expression)) {
+    current_num <- ordered_expression$Gene_Num[i]
+    next_num    <- ordered_expression$Gene_Num[i + 1]
+    
+    if((next_num - current_num) > 5) {
+      # Create an empty blank spacer row (LFC = NA means it won't color in)
+      spacer_row <- data.frame(
+        Gene = paste0("SPACER_", current_num), 
+        model_LFC_06h = NA,
+        model_LFC_24h = NA,
+        KOs = NA,
+        KO = NA,
+        Gene_Num = current_num + 1
+      )
+      spaced_expression[[counter]] <- spacer_row
+      counter <- counter + 1
+    }
+  }
+}
+
+# Bind back into a sequenced data frame
+final_spaced_df <- do.call(rbind, spaced_expression)
+
+# 6. Format labels based on annotation origin and pivot to long format
+heatmap_data <- final_spaced_df %>%
+  mutate(
+    # Clean up empty or missing strings from the native KO database
+    KO_clean = ifelse(is.na(KO) | KO == "" | KO == "NA", "no KO", KO),
+    
+    Gene_KO_Label = case_when(
+      grepl("SPACER", Gene) ~ Gene,
+      
+      # Core pathway hit: Highlight with an asterisk and show enriched KO context
+      !is.na(KOs) & KOs != "" ~ paste0(Gene, "* (", KOs, ")"),
+      
+      # Operon companion gene: Show its native KO from the annotation stats file
+      TRUE ~ paste0(Gene, " (", KO_clean, ")")
+    )
+  ) %>%
+  pivot_longer(
+    cols = c(model_LFC_06h, model_LFC_24h),
+    names_to = "Timepoint",
+    values_to = "LFC"
+  ) %>%
+  mutate(Timepoint = sub("model_LFC_", "", Timepoint))
+
+# Lock in the factor order strictly based on our genomic sequencing layout
+heatmap_data$Gene_KO_Label <- factor(heatmap_data$Gene_KO_Label, levels = unique(heatmap_data$Gene_KO_Label))
+
+# Generate heatmap
+pathway_map <- ggplot(heatmap_data, aes(x = Timepoint, y = Gene_KO_Label, fill = LFC)) +
+  geom_tile(color = "white", lwd = 0.3) +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red", 
+    midpoint = 0, name = "log2 FC", na.value = "transparent" 
+  ) +
+  scale_y_discrete(labels = function(x) ifelse(grepl("SPACER", x), "", x)) +
+  labs(
+    x = "Timepoint", 
+    y = paste0("Genes (KEGG ", intype,") [* = Core Pathway]"),
+    title = pathway_desc, 
+    subtitle = paste("Pathway ID:", target_pathway, "| Source:", just_the_filename)
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.y = element_text(size = 7, family = "mono"),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 12),
+    plot.subtitle = element_text(size = 8, color = "darkgray", hjust = 0.5),
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank()
+  )
+
+# 8. Dynamically scale the output image height based on the row and spacer counts
+calc_heatmap_height <- max(4, nrow(final_spaced_df) * 0.22)
+
+ggsave(
+  filename = file.path(results_out, output_heatmap_name), 
+  plot = pathway_map, width = 6.5, height = calc_heatmap_height, dpi = 300
+)
+
+message("Success! Operon-expanded spaced heatmap saved to: ", file.path(results_out, output_heatmap_name))
+```
+
+# Pathway Visualization
+# Module Mapping
+
+```{r}
+# --- variables and naming ---
+input_file <- "./results/05-mahalanobis-distance/KEGG_Pathway_enrichment_mahal4.0_lfc0.50_q0.1_nterms37_ngenes130.tsv"
+lookup_col <- "Pathway_Class"
+data_table <- read.delim(input_file)
+intype <- "Pathway"
+
+show_category <- nrow(data_table)  # plot all categories (nrow(data_table)) or top x
+sort_category <- "ID" # Options: "GeneRatio_numeric", "qvalue", "Count", "ID" (KO)
+
+just_the_filename <- basename(input_file)
+file_prefix <- tools::file_path_sans_ext(just_the_filename)
+
+# Truncate the prefix so it stops right before "_nterms"
+clean_prefix <- sub("_nterms.*", "", file_prefix)
+
+# Output name now uses the truncated clean prefix
+output_plot_name <- paste0(clean_prefix, "--", sort_category,"--top_", show_category, "--dotplot.png")
+
+# --- data preparation ---
+enrich_df <- read.delim(input_file, sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+
+# Convert GeneRatio from a fraction string to numeric
+if (is.character(enrich_df$GeneRatio)) {
+  enrich_df$GeneRatio_numeric <- sapply(enrich_df$GeneRatio, function(x) {
+    parts <- as.numeric(strsplit(x, "/")[[1]])
+    return(parts[1] / parts[2])
+  })
+} else {
+  enrich_df$GeneRatio_numeric <- enrich_df$GeneRatio
+}
+
+# Combine KO ID and Description
+enrich_df <- enrich_df %>%
+  mutate(ID_Description = paste0(ID, ": ", Description))
+
+# --- FILTER BY MAP NUMBERS ---
+  plot_data <- enrich_df %>%
+    # 1. Clear out NAs from your dynamic lookup column
+    filter(!is.na(.data[[lookup_col]])) %>%
+    
+    # 2. Extract numeric map IDs from the 'ID' column (e.g., "ko04066" -> 4066)
+    mutate(Map_Num = as.numeric(gsub("[^0-9]", "", ID))) %>%
+    
+    # 3. FIX: Blanket filter out all exclusively eukaryotic ranges (4000 to 5999)
+    filter(!(Map_Num >= 4000 & Map_Num <= 5999)) %>%
+    
+    # 4. Sort and pull your top categories
+    arrange(qvalue) %>%                    
+    head(show_category) %>%       
+    mutate(ID_Description = reorder(ID_Description, .data[[sort_category]]))
+# --- plot and export ---
+dot_plot <- ggplot(plot_data, aes(x = GeneRatio_numeric, y = ID_Description)) +
+  geom_point(aes(size = Count, color = qvalue)) + 
+  scale_color_gradient(low = "red", high = "blue", name = "q-value") +
+  scale_size_continuous(name = "Gene Count") +
+  labs(
+    x = "Gene Ratio",
+    y = paste0("KEGG ", intype," Term"),
+    title = paste0("KEGG ", intype," Enrichment Analysis"),
+    subtitle = paste("Source:", just_the_filename)
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.y = element_text(size = 8), 
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 8, color = "darkgray", hjust = 0.5)
+  )
+
+# Dynamically adjust height based on the filtered dataset row count
+calculated_height <- max(5, nrow(plot_data) * 0.22)
+
+# Save the plot dynamically
+ggsave(filename = file.path(results_out, output_plot_name), 
+       plot = dot_plot, 
+       width = 9, 
+       height = calculated_height, 
+       dpi = 300)
+
+message("Success! Plot saved as: ", file.path(results_out, output_plot_name))
+```
+
+For reaction, the basic enrichment dotplot
+then groups
+
+
+```{r}
+# --- variables and naming ---
+input_file <- "./results/05-mahalanobis-distance/KEGG_Reaction_enrichment_mahal4.0_lfc0.50_q0.1_nterms93_ngenes58.tsv"
+data_table <- read.delim(input_file)
+intype <- "Rxn"
+
+show_category <- nrow(data_table)  # plot all categories (nrow(data_table)) or top x
+sort_category <- "ID" # Options: "GeneRatio_numeric", "qvalue", "Count", "ID" (KO)
+
+just_the_filename <- basename(input_file)
+file_prefix <- tools::file_path_sans_ext(just_the_filename)
+
+# Truncate the prefix so it stops right before "_nterms"
+clean_prefix <- sub("_nterms.*", "", file_prefix)
+
+# Output name now uses the truncated clean prefix
+output_plot_name <- paste0(clean_prefix, "--", sort_category,"--top_", show_category, "--dotplot.png")
+
+# --- data preparation ---
+# Load the data
+enrich_df <- read.delim(input_file, sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+
+# Convert GeneRatio from a fraction string to numeric
+if (is.character(enrich_df$GeneRatio)) {
+  enrich_df$GeneRatio_numeric <- sapply(enrich_df$GeneRatio, function(x) {
+    parts <- as.numeric(strsplit(x, "/")[[1]])
+    return(parts[1] / parts[2])
+  })
+} else {
+  enrich_df$GeneRatio_numeric <- enrich_df$GeneRatio
+}
+
+# Combine KO ID and Description (e.g., "ko00010: Glycolysis / Gluconeogenesis")
+enrich_df <- enrich_df %>%
+  mutate(ID_Description = paste0(ID, ": ", Description))
+
+plot_data <- enrich_df %>%
+  arrange(qvalue) %>%                    
+  head(show_category) %>% # FIX 1: Fixed variable name spelling       
+  # FIX 2: Used .data[[ ]] to safely allow dynamic string sorting
+  mutate(ID_Description = reorder(ID_Description, .data[[sort_category]]))
+
+# --- plot and export ---
+dot_plot <- ggplot(plot_data, aes(x = GeneRatio_numeric, y = ID_Description)) +
+  geom_point(aes(size = Count, color = qvalue)) + 
+  scale_color_gradient(low = "red", high = "blue", name = "q-value") +
+  scale_size_continuous(name = "Gene Count") +
+  labs(
+    x = "Gene Ratio",
+    y = paste0("KEGG ", intype," Term"),
+    title = paste0("KEGG ", intype," Enrichment Analysis"),
+    subtitle = paste("Source:", just_the_filename)
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.y = element_text(size = 8), # Sightly smaller font for 42 terms
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 8, color = "darkgray", hjust = 0.5)
+  )
+
+# FIX 3: Dynamically adjust height. 42 terms needs more vertical room than 20 terms!
+calculated_height <- max(5, show_category * 0.22)
+
+# Save the plot dynamically
+ggsave(filename = file.path(results_out, output_plot_name), 
+       plot = dot_plot, 
+       width = 9, 
+       height = calculated_height, 
+       dpi = 300)
+
+message("Success! Plot saved as: ", file.path(results_out, output_plot_name))
+```
+```{r}
+# --- variables and naming ---
+input_file <- "./results/05-mahalanobis-distance/KEGG_Reaction_enrichment_mahal4.0_lfc0.50_q0.1_nterms93_ngenes58.tsv"
+data_table <- read.delim(input_file)
+intype <- "Rxn"
+
+# ADDED/UPDATED: Filtering parameters
+padj_threshold <- 0.05  # Set your p.adj threshold cutoff here
+max_terms      <- 20    # NEW: Max number of terms you want to display on the plot
+
+# Dynamic categorical selection
+sort_category <- "ID" # Options: "GeneRatio_numeric", "padj", "Count", "ID" (KO)
+
+just_the_filename <- basename(input_file)
+file_prefix <- tools::file_path_sans_ext(just_the_filename)
+
+# Truncate the prefix so it stops right before "_nterms"
+clean_prefix <- sub("_nterms.*", "", file_prefix)
+
+# --- data preparation ---
+# Load the data safely
+enrich_df <- read.delim(input_file, sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+
+# Auto-detect column naming variant for p.adj
+if ("p.adj" %in% colnames(enrich_df)) {
+  enrich_df$padj <- as.numeric(enrich_df$p.adj)
+} else if ("padj" %in% colnames(enrich_df)) {
+  enrich_df$padj <- as.numeric(enrich_df$padj)
+} else if ("qvalue" %in% colnames(enrich_df)) {
+  enrich_df$padj <- as.numeric(enrich_df$qvalue) 
+} else {
+  stop("Could not find a p.adj, padj, or qvalue column!")
+}
+
+# Convert GeneRatio from a fraction string to numeric safely
+if ("GeneRatio" %in% colnames(enrich_df) && is.character(enrich_df$GeneRatio)) {
+  enrich_df$GeneRatio_numeric <- sapply(enrich_df$GeneRatio, function(x) {
+    x_clean <- gsub(" ", "", x) 
+    parts <- as.numeric(strsplit(x_clean, "/")[[1]])
+    if(length(parts) == 2 && !any(is.na(parts))) {
+      return(parts[1] / parts[2])
+    } else {
+      return(NA)
+    }
+  })
+} else if ("GeneRatio" %in% colnames(enrich_df)) {
+  enrich_df$GeneRatio_numeric <- as.numeric(enrich_df$GeneRatio)
+} else {
+  stop("Could not find 'GeneRatio' column.")
+}
+
+# Truncate Description at first ';' or 50 characters
+enrich_df <- enrich_df %>%
+  mutate(Description_clean = sub(";.*", "", Description)) %>%
+  mutate(Description_clean = substr(Description_clean, 1, 50)) %>%
+  mutate(ID_Description = paste0(ID, ": ", Description_clean))
+
+# Ensure Count is explicitly numeric 
+enrich_df$Count <- as.numeric(enrich_df$Count)
+
+# --- FILTER & SORT PIPELINE ---
+plot_data <- enrich_df %>%
+  # 1. Drop true NA rows across essential visual spaces
+  filter(!is.na(GeneRatio_numeric), !is.na(Count), !is.na(padj)) %>%
+  # 2. Filter on your padj threshold first
+  filter(padj <= padj_threshold) %>%
+  # 3. Sort strictly by your chosen variable (e.g., "ID")
+  arrange(.data[[sort_category]]) %>%
+  # 4. Limit to the maximum number of terms specified
+  head(max_terms)
+
+# Set dynamic category count for naming based on what survived the cut
+show_category <- nrow(plot_data)
+
+# Output name accounts for the thresholds and caps
+output_plot_name <- paste0(clean_prefix, "--", sort_category,"--padj_", padj_threshold, "--top_", show_category, "--dotplot.png")
+
+# Explicitly lock in the y-axis order exactly based on the alphabetical ID sort order
+plot_data$ID_Description <- factor(plot_data$ID_Description, levels = unique(plot_data$ID_Description))
+
+# --- DEBUG PRINT ---
+message("Rows to plot after padj filtering and max cap: ", nrow(plot_data))
+if (nrow(plot_data) > 0) {
+  print(head(plot_data[, c("ID_Description", "GeneRatio_numeric", "Count", "padj")]))
+} else {
+  stop("Error: 0 rows passed your filtering criteria!")
+}
+
+# --- plot and export ---
+dot_plot <- ggplot(plot_data, aes(x = GeneRatio_numeric, y = ID_Description)) +
+  geom_point(aes(size = Count, color = padj)) +   
+  scale_x_continuous(expand = expansion(mult = c(0.1, 0.1))) + 
+  scale_color_gradient(low = "red", high = "blue", name = "p.adj") +
+  scale_size_continuous(name = "Gene Count") +
+  labs(
+    x = "Gene Ratio",
+    y = paste0("KEGG ", intype," Term"),
+    title = paste0("KEGG ", intype," Enrichment Analysis"),
+    subtitle = paste("Source:", just_the_filename)
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.y = element_text(size = 8, hjust = 1, vjust = 0.5), 
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 8, color = "darkgray", hjust = 0.5),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 20, unit = "pt") 
+  )
+
+# Dynamically adjust height to accommodate the capped row count cleanly
+calculated_height <- max(5, nrow(plot_data) * 0.25)
+
+# Save the plot
+ggsave(filename = file.path(results_out, output_plot_name), 
+       plot = dot_plot, 
+       width = 11,               
+       height = calculated_height, 
+       limitsize = FALSE,        
+       dpi = 300)
+
+message("Success! Plot saved as: ", file.path(results_out, output_plot_name))
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# 1. Clean and build the Reaction -> Module Edge List
+edges_modules <- enrich_df %>%
+  # Keep only reaction ID and the Module string
+  select(from = ID, Group_Raw = Modules) %>%
+  filter(!is.na(Group_Raw) & Group_Raw != "" & Group_Raw != "NA") %>%
+  # Split pipe-separated modules into individual rows
+  separate_rows(Group_Raw, sep = " \\| ") %>%
+  mutate(Group_Raw = trimws(Group_Raw)) %>%
+  # Extract code (Mxxxxx) and descriptive name
+  separate(Group_Raw, into = c("to_id", "to_name"), sep = ": ", 
+           extra = "merge", fill = "right") %>%
+  mutate(Type = "Module")
+
+# 2. Clean and build the Reaction -> Pathway Edge List
+edges_pathways <- enrich_df %>%
+  select(from = ID, Group_Raw = Pathways) %>%
+  filter(!is.na(Group_Raw) & Group_Raw != "" & Group_Raw != "NA") %>%
+  separate_rows(Group_Raw, sep = " \\| ") %>%
+  mutate(Group_Raw = trimws(Group_Raw)) %>%
+  separate(Group_Raw, into = c("to_id", "to_name"), sep = ": ", 
+           extra = "merge", fill = "right") %>%
+  # BLACKLIST: Drop global/overview pathways (rn01100, rn01120, etc.)
+  filter(!to_id %in% c("rn01100", "rn01120")) %>%
+  mutate(Type = "Pathway")
+
+# 3. Combine into a master edge list
+network_edges <- bind_rows(edges_modules, edges_pathways) %>%
+  # The 'to' column for the network needs to use the unique ID code
+  mutate(to = to_id) %>%
+  select(from, to, to_name, Type)
+
+# Quick check of the edge architecture
+print(head(network_edges))
+```
+
+```{r}
+# GENERATE UNIFIED NODE LIST WITH METADATA
+
+
+# Reaction Nodes Metadata
+nodes_reactions <- enrich_df %>%
+  filter(ID %in% network_edges$from) %>%
+  select(node_id = ID, qvalue, Count) %>%
+  mutate(
+    Node_Type = "Reaction",
+    Label = node_id,
+    Node_Size = 3, 
+    Fill_Value = qvalue
+  )
+
+# Group Nodes (Modules/Pathways) Metadata
+group_counts <- network_edges %>%
+  group_by(to, to_name, Type) %>%
+  summarise(Enriched_Reaction_Count = n(), .groups = "drop")
+
+nodes_groups <- group_counts %>%
+  select(node_id = to, Label = to_name, Node_Type = Type, Node_Size = Enriched_Reaction_Count) %>%
+  mutate(
+    qvalue = NA,
+    Count = NA,
+    Fill_Value = NA
+  )
+
+# Combine both sets of nodes
+master_nodes <- bind_rows(nodes_reactions, nodes_groups)
+
+# MAKE GRAPH OBJECT
+
+clean_graph_obj <- tbl_graph(nodes = master_nodes, edges = network_edges, directed = FALSE) %>%
+  # Activate the nodes layer to calculate degree
+  activate(nodes) %>%
+  # Calculate the number of connections for each node
+  mutate(node_degree = centrality_degree()) %>%
+  # CRITICAL FILTER: Keep only nodes that have 1 or more connections
+  filter(node_degree > 1)
+
+# plot clean network
+
+network_plot_clean <- ggraph(clean_graph_obj, layout = "stress") + 
+  geom_edge_link(aes(color = Type), alpha = 0.2, width = 0.4) +
+  geom_node_point(aes(shape = Node_Type, size = Node_Size, color = Fill_Value)) +
+  
+  scale_color_gradient(low = "darkred", high = "gold", na.value = "lightgray", 
+                       name = "Reaction q-value") +
+  scale_size_continuous(range = c(2.5, 9), name = "Reaction Count / Size") +
+  scale_shape_manual(values = c("Reaction" = 16, "Module" = 15, "Pathway" = 17),
+                     name = "Node Classification") +
+  
+  # Repel text labels cleanly, only showing pathway/module descriptors
+  geom_node_text(aes(label = ifelse(Node_Type != "Reaction", Label, "")), 
+                 repel = TRUE, size = 2.5, fontface = "bold", max.overlaps = 30) +
+  
+  theme_graph() +
+  labs(
+    title = "Connected KEGG Reaction Crosstalk Network",
+    subtitle = "Orphan nodes removed; showing shared reaction architectures"
+  )
+
+print(network_plot_clean)
+
+ggsave(file.path(results_out,"networkmap-rxn-pathway-module.png"))
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(tidygraph)
+library(ggraph)
+library(ggplot2)
+
+# ==============================================================================
+# DATA PREPARATION (REACTION ATTRIBUTES)
+# ==============================================================================
+# Define baseline metadata for the 100 core reaction nodes
+nodes_reactions_base <- enrich_df %>%
+  select(node_id = ID, qvalue) %>%
+  mutate(
+    Node_Type = "Reaction",
+    Label = node_id,
+    Node_Size = 3, 
+    Fill_Value = qvalue
+  )
+
+# ==============================================================================
+# FIGURE 1: MODULE CROSSTALK NETWORK (FIXED LABELS)
+# ==============================================================================
+plot_modules <- ggraph(graph_mod, layout = "stress") +
+  geom_edge_link(color = "steelblue", alpha = 0.15, width = 0.4) +
+  geom_node_point(aes(shape = Node_Type, size = Node_Size, color = Fill_Value)) +
+  scale_color_gradient(low = "darkred", high = "gold", na.value = "lightgrey", name = "Reaction q-value") +
+  scale_size_continuous(range = c(2, 8), name = "Module Size") +
+  scale_shape_manual(values = c("Reaction" = 16, "Module" = 15)) +
+  
+  # FIX: Use .data$Node_Type so it matches the filtered node count exactly
+  geom_node_text(aes(label = Label, 
+                     fontface = ifelse(.data$Node_Type == "Reaction", "plain", "bold")), 
+                 repel = TRUE, 
+                 size = 2.2, 
+                 max.overlaps = 50) +
+  theme_graph() +
+  labs(title = "Reaction-to-Module Enrichment Network", subtitle = "Labeled with Reaction codes (Rxxxxx)")
+
+print(plot_modules)
+
+
+# ==============================================================================
+# FIGURE 2: PATHWAY CROSSTALK NETWORK (FIXED LABELS)
+# ==============================================================================
+plot_pathways <- ggraph(graph_path, layout = "stress") +
+  geom_edge_link(color = "darkorange", alpha = 0.15, width = 0.4) +
+  geom_node_point(aes(shape = Node_Type, size = Node_Size, color = Fill_Value)) +
+  scale_color_gradient(low = "darkred", high = "gold", na.value = "lightgrey", name = "Reaction q-value") +
+  scale_size_continuous(range = c(2, 8), name = "Pathway Size") +
+  scale_shape_manual(values = c("Reaction" = 16, "Pathway" = 17)) +
+  
+  # FIX: Use .data$Node_Type so it matches the filtered node count exactly
+  geom_node_text(aes(label = Label, 
+                     fontface = ifelse(.data$Node_Type == "Reaction", "plain", "bold")), 
+                 repel = TRUE, 
+                 size = 2.2, 
+                 max.overlaps = 50) +
+  theme_graph() +
+  labs(title = "Reaction-to-Pathway Enrichment Network", subtitle = "Labeled with Reaction codes (Rxxxxx)")
+
+print(plot_pathways)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(tidygraph)
+library(ggraph)
+library(ggplot2)
+
+# ==============================================================================
+# DATA PREPARATION (REACTION ATTRIBUTES)
+# ==============================================================================
+# Define baseline metadata for the 100 core reaction nodes
+nodes_reactions_base <- enrich_df %>%
+  select(node_id = ID, qvalue) %>%
+  mutate(
+    Node_Type = "Reaction",
+    Label = node_id,
+    Node_Size = 3, 
+    Fill_Value = qvalue
+  )
+
+# ==============================================================================
+# FIGURE 1: MODULE CROSSTALK NETWORK (GIANT COMPONENT ONLY)
+# ==============================================================================
+graph_mod_giant <- tbl_graph(nodes = bind_rows(nodes_reactions_base, nodes_mod), 
+                             edges = edges_mod, directed = FALSE) %>%
+  activate(nodes) %>%
+  mutate(
+    node_degree = centrality_degree(),
+    # Identify which separate "island" group each node belongs to
+    component = group_components()
+  ) %>%
+  filter(node_degree > 0) %>%
+  # CRITICAL FILTER: Keep only the component that has the absolute most nodes
+  filter(component == which.max(tabulate(component)))
+
+plot_modules_giant <- ggraph(graph_mod_giant, layout = "stress") +
+  geom_edge_link(color = "steelblue", alpha = 0.15, width = 0.4) +
+  geom_node_point(aes(shape = Node_Type, size = Node_Size, color = Fill_Value)) +
+  scale_color_gradient(low = "darkred", high = "gold", na.value = "lightgrey", name = "Reaction q-value") +
+  scale_size_continuous(range = c(2, 8), name = "Module Size") +
+  scale_shape_manual(values = c("Reaction" = 16, "Module" = 15)) +
+  geom_node_text(aes(label = Label, 
+                     fontface = ifelse(.data$Node_Type == "Reaction", "plain", "bold")), 
+                 repel = TRUE, size = 2.2, max.overlaps = 50) +
+  theme_graph() +
+  labs(title = "Reaction-to-Module Network (Main Component)", 
+       subtitle = "Isolated peripheral chains and small subgraphs removed")
+
+print(plot_modules_giant)
+
+
+# ==============================================================================
+# FIGURE 2: PATHWAY CROSSTALK NETWORK (GIANT COMPONENT ONLY)
+# ==============================================================================
+graph_path_giant <- tbl_graph(nodes = bind_rows(nodes_reactions_base, nodes_path), 
+                              edges = edges_path, directed = FALSE) %>%
+  activate(nodes) %>%
+  mutate(
+    node_degree = centrality_degree(),
+    component = group_components()
+  ) %>%
+  filter(node_degree > 0) %>%
+  # CRITICAL FILTER: Keep only the giant component
+  filter(component == which.max(tabulate(component)))
+
+plot_pathways_giant <- ggraph(graph_path_giant, layout = "stress") +
+  geom_edge_link(color = "darkorange", alpha = 0.15, width = 0.4) +
+  geom_node_point(aes(shape = Node_Type, size = Node_Size, color = Fill_Value)) +
+  scale_color_gradient(low = "darkred", high = "gold", na.value = "lightgrey", name = "Reaction q-value") +
+  scale_size_continuous(range = c(2, 8), name = "Pathway Size") +
+  scale_shape_manual(values = c("Reaction" = 16, "Pathway" = 17)) +
+  geom_node_text(aes(label = Label, 
+                     fontface = ifelse(.data$Node_Type == "Reaction", "plain", "bold")), 
+                 repel = TRUE, size = 2.2, max.overlaps = 50) +
+  theme_graph() +
+  labs(title = "Reaction-to-Pathway Network (Main Component)", 
+       subtitle = "Isolated peripheral chains and small subgraphs removed")
+
+print(plot_pathways_giant)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(tidygraph)
+library(ggraph)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tidygraph)
+library(ggraph)
+library(ggplot2)
+
+# ==============================================================================
+# FIGURE 1: MODULE NETWORK (LAYER-SEPARATED DESIGN)
+# ==============================================================================
+plot_modules_clean <- ggraph(graph_mod_giant, layout = "fr") +
+  # 1. Soft grey background lines
+  geom_edge_link(color = "grey85", alpha = 0.5, width = 0.3) +
+  
+  # 2. Node Points (Gradients and shapes are completely restored!)
+  geom_node_point(aes(shape = Node_Type, size = Node_Size, color = Fill_Value)) +
+  scale_color_gradient(low = "darkred", high = "orange", na.value = "deepskyblue4", name = "Reaction q-value") +
+  scale_size_continuous(range = c(2.5, 7.5), name = "Module Size") +
+  scale_shape_manual(values = c("Reaction" = 16, "Module" = 15), name = "Node Type") +
+  
+  # 3. Layer for Reaction Labels (Small, light grey text)
+  geom_node_text(
+    aes(label = ifelse(Node_Type == "Reaction", Label, "")),
+    color = "grey65", size = 1.8, fontface = "plain", repel = TRUE, max.overlaps = 40
+  ) +
+  
+  # 4. Layer for Module Labels (Larger, bold black text)
+  geom_node_text(
+    aes(label = ifelse(Node_Type == "Module", Label, "")),
+    color = "black", size = 3.0, fontface = "bold", repel = TRUE, max.overlaps = 20
+  ) +
+  
+  theme_graph() +
+  labs(
+    title = "Reaction-to-Module Network (High Contrast Layout)", 
+    subtitle = "Vivid module hubs with faded background reaction details"
+  )
+
+print(plot_modules_clean)
+
+
+# ==============================================================================
+# FIGURE 2: PATHWAY NETWORK (LAYER-SEPARATED DESIGN)
+# ==============================================================================
+plot_pathways_clean <- ggraph(graph_path_giant, layout = "fr") +
+  # 1. Soft grey background lines
+  geom_edge_link(color = "grey85", alpha = 0.5, width = 0.3) +
+  
+  # 2. Node Points
+  geom_node_point(aes(shape = Node_Type, size = Node_Size, color = Fill_Value)) +
+  scale_color_gradient(low = "darkred", high = "orange", na.value = "purple4", name = "Reaction q-value") +
+  scale_size_continuous(range = c(2.5, 7.5), name = "Pathway Size") +
+  scale_shape_manual(values = c("Reaction" = 16, "Pathway" = 17), name = "Node Type") +
+  
+  # 3. Layer for Reaction Labels (Small, light grey text)
+  geom_node_text(
+    aes(label = ifelse(Node_Type == "Reaction", Label, "")),
+    color = "grey65", size = 1.8, fontface = "plain", repel = TRUE, max.overlaps = 40
+  ) +
+  
+  # 4. Layer for Pathway Labels (Larger, bold black text)
+  geom_node_text(
+    aes(label = ifelse(Node_Type == "Pathway", Label, "")),
+    color = "black", size = 3.0, fontface = "bold", repel = TRUE, max.overlaps = 20
+  ) +
+  
+  theme_graph() +
+  labs(
+    title = "Reaction-to-Pathway Network (High Contrast Layout)", 
+    subtitle = "Vivid pathway hubs with faded background reaction details"
+  )
+
+print(plot_pathways_clean)
+```
+```{r}
+
+# ==============================================================================
+# 1. SAVE THE MODULE NETWORK
+# ==============================================================================
+# Generate the plot object
+plot_modules_clean <- ggraph(graph_mod_giant, layout = "fr") +
+  geom_edge_link(color = "grey85", alpha = 0.5, width = 0.3) +
+  geom_node_point(aes(shape = Node_Type, size = Node_Size, color = Fill_Value)) +
+  scale_color_gradient(low = "darkred", high = "orange", na.value = "deepskyblue4", name = "Reaction q-value") +
+  scale_size_continuous(range = c(2.5, 8), name = "Module Size") +
+  scale_shape_manual(values = c("Reaction" = 16, "Module" = 15), name = "Node Type") +
+  geom_node_text(aes(label = ifelse(Node_Type == "Reaction", Label, "")),
+                 color = "grey65", size = 2.0, fontface = "plain", repel = TRUE, max.overlaps = 50) +
+  geom_node_text(aes(label = ifelse(Node_Type == "Module", Label, "")),
+                 color = "black", size = 3.2, fontface = "bold", repel = TRUE, max.overlaps = 20) +
+  theme_graph() +
+  labs(title = "Reaction-to-Module Network", subtitle = "Large-scale layout; orphan chains removed")
+
+# Save to file with a large physical canvas (12x12 inches at 300 DPI)
+module_out_path <- file.path(results_out, "kegg_reaction_to_module_network.png")
+ggsave(
+  filename = module_out_path,
+  plot = plot_modules_clean,
+  width = 12,
+  height = 12,
+  dpi = 300,
+  bg = "white"
+)
+message("Success! Module network graph saved to: ", module_out_path)
+
+
+# ==============================================================================
+# 2. SAVE THE PATHWAY NETWORK
+# ==============================================================================
+# Generate the plot object
+plot_pathways_clean <- ggraph(graph_path_giant, layout = "fr") +
+  geom_edge_link(color = "grey85", alpha = 0.5, width = 0.3) +
+  geom_node_point(aes(shape = Node_Type, size = Node_Size, color = Fill_Value)) +
+  scale_color_gradient(low = "darkred", high = "orange", na.value = "purple4", name = "Reaction q-value") +
+  scale_size_continuous(range = c(2.5, 8), name = "Pathway Size") +
+  scale_shape_manual(values = c("Reaction" = 16, "Pathway" = 17), name = "Node Type") +
+  geom_node_text(aes(label = ifelse(Node_Type == "Reaction", Label, "")),
+                 color = "grey65", size = 2.0, fontface = "plain", repel = TRUE, max.overlaps = 50) +
+  geom_node_text(aes(label = ifelse(Node_Type == "Pathway", Label, "")),
+                 color = "black", size = 3.2, fontface = "bold", repel = TRUE, max.overlaps = 20) +
+  theme_graph() +
+  labs(title = "Reaction-to-Pathway Network", subtitle = "Large-scale layout; orphan chains removed")
+
+# Save to file with a large physical canvas (12x12 inches at 300 DPI)
+pathway_out_path <- file.path(results_out, "kegg_reaction_to_pathway_network.png")
+ggsave(
+  filename = pathway_out_path,
+  plot = plot_pathways_clean,
+  width = 12,
+  height = 12,
+  dpi = 300,
+  bg = "white"
+)
+message("Success! Pathway network graph saved to: ", pathway_out_path)
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tidygraph)
+library(ggraph)
+library(ggplot2)
+
+# ==============================================================================
+# 1. PARSE GENE WEIGHTS FROM ENRICH_DF
+# ==============================================================================
+# Count how many individual genes are assigned to each reaction row
+enrich_weighted <- enrich_df %>%
+  mutate(
+    # Clean and split the geneID column (assumes it is slash '/' or comma separated)
+    # Adjust sep if your geneID uses a different delimiter (e.g., ", " or ";")
+    Gene_Count = str_count(geneID, "[^/,;]+") 
+  )
+
+# ==============================================================================
+# 2. GENERATE GENE-WEIGHTED MODULE EDGES & NODES
+# ==============================================================================
+edges_mod_weighted <- enrich_weighted %>%
+  select(from = ID, Group_Raw = Modules, Gene_Count) %>%
+  filter(!is.na(Group_Raw) & Group_Raw != "" & Group_Raw != "NA") %>%
+  separate_rows(Group_Raw, sep = " \\| ") %>%
+  mutate(Group_Raw = trimws(Group_Raw)) %>%
+  separate(Group_Raw, into = c("to", "to_name"), sep = ": ", extra = "merge", fill = "right")
+
+# Create Module Nodes where size is determined by total GENE WEIGHT
+nodes_mod_weighted <- edges_mod_weighted %>%
+  group_by(to, to_name) %>%
+  # SUM the gene counts instead of counting the rows of reactions
+  summarise(Total_Gene_Weight = sum(Gene_Count, na.rm = TRUE), .groups = "drop") %>%
+  select(node_id = to, Label = to_name, Node_Size = Total_Gene_Weight) %>%
+  mutate(Node_Type = "Module", Fill_Value = NA)
+
+# Base reaction nodes with their specific gene counts as node sizes
+nodes_reactions_weighted <- enrich_weighted %>%
+  filter(ID %in% edges_mod_weighted$from) %>%
+  select(node_id = ID, qvalue, Gene_Count) %>%
+  mutate(
+    Node_Type = "Reaction",
+    Label = node_id,
+    Node_Size = Gene_Count, # Reaction dots scale by how many genes drive them
+    Fill_Value = qvalue
+  )
+
+# ==============================================================================
+# 3. BUILD THE GENE-WEIGHTED GIANT COMPONENT
+# ==============================================================================
+master_nodes_weighted <- bind_rows(nodes_reactions_weighted, nodes_mod_weighted)
+
+graph_mod_weighted <- tbl_graph(nodes = master_nodes_weighted, 
+                                edges = edges_mod_weighted, directed = FALSE) %>%
+  activate(nodes) %>%
+  mutate(
+    node_degree = centrality_degree(),
+    component = group_components()
+  ) %>%
+  filter(node_degree > 0) %>%
+  filter(component == which.max(tabulate(component)))
+
+# ==============================================================================
+# 4. PLOT GENE-WEIGHTED NETWORK AND AUTOSAVE
+# ==============================================================================
+plot_modules_weighted <- ggraph(graph_mod_weighted, layout = "fr") +
+  geom_edge_link(color = "grey85", alpha = 0.5, width = 0.3) +
+  
+  # Sizes now natively scale to Gene Weights!
+  geom_node_point(aes(shape = Node_Type, size = Node_Size, color = Fill_Value)) +
+  scale_color_gradient(low = "darkred", high = "orange", na.value = "deepskyblue4", name = "Reaction q-value") +
+  scale_size_continuous(range = c(2.5, 12), name = "Gene Abundance / Weight") +
+  scale_shape_manual(values = c("Reaction" = 16, "Module" = 15), name = "Node Type") +
+  
+  geom_node_text(aes(label = ifelse(Node_Type == "Reaction", Label, "")),
+                 color = "grey65", size = 1.8, fontface = "plain", repel = TRUE, max.overlaps = 50) +
+  geom_node_text(aes(label = ifelse(Node_Type == "Module", Label, "")),
+                 color = "black", size = 3.2, fontface = "bold", repel = TRUE, max.overlaps = 20) +
+  theme_graph() +
+  labs(
+    title = "Gene-Weighted Reaction-to-Module Network", 
+    subtitle = "Hub sizes scale by total gene count across pathways"
+  )
+
+# Autosave out to your directory
+
+weighted_out_path <- file.path(results_out, "kegg_gene_weighted_module_network.png")
+
+ggsave(
+  filename = weighted_out_path, plot = plot_modules_weighted,
+  width = 12, height = 12, dpi = 300, bg = "white"
+)
+message("Success! Gene-weighted network saved to: ", weighted_out_path)
+```
+```{r}
+# ==============================================================================
+# PRINT TOP ENRICHED ELEMENTS BY GENE CONTRIBUTION
+# ==============================================================================
+library(tibble)
+
+# Extract node data from the giant component graph object
+node_data <- graph_mod_weighted %>% 
+  activate(nodes) %>% 
+  as_tibble()
+
+# Set 'X' to however many top nodes you want to view
+top_x <- 12
+
+cat("\n=== TOP", top_x, "MODULE HUBS BY GENE CONTRIBUTION ===\n")
+top_modules <- node_data %>%
+  filter(Node_Type == "Module") %>%
+  arrange(desc(Node_Size)) %>%
+  slice_head(n = top_x) %>%
+  select(Module_ID = node_id, Module_Name = Label, Total_Gene_Weight = Node_Size)
+
+print(as.data.frame(top_modules), row.names = FALSE)
+
+
+cat("\n=== TOP", top_x, "INDIVIDUAL REACTIONS BY GENE CONTRIBUTION ===\n")
+top_reactions <- node_data %>%
+  filter(Node_Type == "Reaction") %>%
+  arrange(desc(Node_Size)) %>%
+  slice_head(n = top_x) %>%
+  select(Reaction_ID = node_id, qvalue, Gene_Count = Node_Size)
+
+print(as.data.frame(top_reactions), row.names = FALSE)
+```
+
+
+```{r}
+
+
+# ==============================================================================
+# BUILD THE INCLUSIVE GENE-WEIGHTED METABOLIC GRAPH
+# ==============================================================================
+graph_mod_inclusive <- tbl_graph(nodes = bind_rows(nodes_reactions_weighted, nodes_mod_weighted), 
+                                 edges = edges_mod_weighted, directed = FALSE) %>%
+  activate(nodes) %>%
+  mutate(
+    node_degree = centrality_degree(),
+    component = group_components()
+  ) %>%
+  # Remove completely unlinked singletons (0 connections)
+  filter(node_degree > 0) %>%
+  
+  # CRITERIA: Keep the giant component OR any smaller satellite component 
+  # that contains a highly significant reaction (qvalue < 0.05)
+  group_by(component) %>%
+  mutate(
+    is_giant = (component == which.max(tabulate(component))),
+    has_high_sig = any(Node_Type == "Reaction" & Fill_Value < 0.05, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  filter(is_giant | has_high_sig)
+
+# ==============================================================================
+# PLOT WITH AN ISLAND-FRIENDLY MULTI-COMPONENT LAYOUT ("nicely")
+# ==============================================================================
+plot_modules_inclusive <- ggraph(graph_mod_inclusive, layout = "nicely") +
+  # Light background lines
+  geom_edge_link(color = "grey85", alpha = 0.5, width = 0.3) +
+  
+  # Nodes mapped to your gene weights and q-values
+  geom_node_point(aes(shape = Node_Type, size = Node_Size, color = Fill_Value)) +
+  scale_color_gradient(low = "darkred", high = "orange", na.value = "deepskyblue4", name = "Reaction q-value") +
+  scale_size_continuous(range = c(2.5, 12), name = "Gene Abundance / Weight") +
+  scale_shape_manual(values = c("Reaction" = 16, "Module" = 15), name = "Node Type") +
+  
+  # Faded plain text for Reaction codes
+  geom_node_text(aes(label = ifelse(Node_Type == "Reaction", Label, "")),
+                 color = "grey65", size = 1.8, fontface = "plain", repel = TRUE, max.overlaps = 50) +
+  
+  # Bold dark text for the Module Hubs
+  geom_node_text(aes(label = ifelse(Node_Type == "Module", Label, "")),
+                 color = "black", size = 3.2, fontface = "bold", repel = TRUE, max.overlaps = 20) +
+  
+  theme_graph() +
+  labs(
+    title = "Inclusive Reaction-to-Module Network", 
+    subtitle = "Central fatty acid core with orbiting high-fold-change satellite pathways"
+  )
+
+# ==============================================================================
+# AUTOSAVE TO CENTRAL RESULTS DIRECTORY
+# ==============================================================================
+inclusive_out_path <- file.path(results_out, "kegg_inclusive_module_network.png")
+
+ggsave(
+  filename = inclusive_out_path, 
+  plot = plot_modules_inclusive,
+  width = 14, 
+  height = 14, 
+  dpi = 300, 
+  bg = "white"
+)
+
+message("Success! Inclusive network layout saved to: ", inclusive_out_path)
+```
+

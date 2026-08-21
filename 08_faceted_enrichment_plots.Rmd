@@ -1,0 +1,613 @@
+---
+title: "Untitled"
+author: "Kira Goff"
+date: "2026-08-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load-library}
+library(tidyverse)
+```
+
+For some reason, some combination of running the facet sorting chunks twice and the figure generation twice results in the correct ordering of the descriptions with a facet.
+
+Just roll with it. 
+
+# STYLE DEFINITIONS
+
+```{r universal-formatting}
+colour_scale <- "plasma"
+scale_direction <- -1
+xgrid_colour <- "grey93"
+xgrid_linetype <- "solid"
+ygrid_colour <- "grey93"
+ygrid_linetype <- "dotted"
+x_text <- "Hierarchical Clustering of Fuzzy Clusters"
+save_dir <- "/mnt/work-drive/kira/rproj-rnaseq/results2/new-gsea-facet-plots/"
+tsv_dir <- "/mnt/work-drive/kira/rproj-rnaseq/results2/04-cluster-enrichment-auto-q-naremove/"
+```
+
+```{r pathway-formatting}
+y_text_p <- "Pathway Description"
+figure_title_p <- "Significantly Enriched KEGG Pathways"
+caption_text_p <- "Pathways grouped by functional subcatetory. Significance cutoff q < 0.05."
+width_p <- 10
+height_p <- 12
+```
+
+```{r module-formatting}
+y_text_m <- "Module Description"
+figure_title_m <- "Significantly Enriched KEGG Modules"
+caption_text_m <- "Modules grouped by functional subcatetory. Significance cutoff q < 0.05."
+width_m <- 10
+height_m <- 12
+```
+
+```{r cog-letter-formatting}
+y_text_c <- "Letter Code Description"
+figure_title_c <- "Significantly Enriched COG Letter Codes"
+caption_text_c <- "Letter codes grouped by functional catetory. Significance cutoff q < 0.05."
+width_c <- 10
+height_c <- 10
+```
+
+
+
+# KEGG PATHWAYS
+
+## ingestion
+
+```{r import-and-fetch-data}
+# read files in
+folder_path <- file.path(tsv_dir,"KEGG_Pathway")  
+files <- list.files(folder_path, pattern = "\\.csv$", full.names = TRUE) #currently using tsvs named as csv
+combined_df <- bind_rows(lapply(files, read.delim, stringsAsFactors = FALSE))
+
+# extract unique pathway IDs and query KEGG REST API
+unique_ids <- unique(gsub("path:", "", combined_df$ID))
+
+get_kegg_class <- function(path_id) {
+  url <- paste0("https://rest.kegg.jp/get/", path_id)
+  tryCatch({
+    lines <- readLines(url, warn = FALSE)
+    class_line <- lines[grep("^CLASS", lines)]
+    if(length(class_line) > 0) {
+      sub_cat <- sub("^CLASS\\s+", "", class_line)
+      return(data.frame(ID = path_id, Subcategory_Full = sub_cat, stringsAsFactors = FALSE))
+    }
+  }, error = function(e) NULL)
+  return(data.frame(ID = path_id, Subcategory_Full = "Unmapped", stringsAsFactors = FALSE))
+}
+
+message("Fetching sub-categories directly from KEGG API...")
+kegg_meta_list <- lapply(unique_ids, function(id) {
+  res <- get_kegg_class(id)
+  Sys.sleep(0.1) 
+  return(res)
+})
+
+kegg_meta <- bind_rows(kegg_meta_list) %>%
+  mutate(Subcategory = sub(".*;\\s*", "", Subcategory_Full))
+```
+
+```{r merge-and-override-clusters}
+# merge data and force custom overrides when things are at a weird level
+combined_df_annotated <- combined_df %>%
+  mutate(Clean_ID = gsub("path:", "", ID)) %>%
+  left_join(kegg_meta, by = c("Clean_ID" = "ID")) %>%
+  mutate(
+    Subcategory = replace_na(Subcategory, "Other Pathways"),
+    Subcategory = case_when(
+      Clean_ID == "map01212" ~ "Lipid metabolism",
+      Clean_ID == "map01200" ~ "Carbohydrate metabolism",
+      Clean_ID == "map01230" ~ "Amino acid metabolism",
+      Clean_ID == "map00410" ~ "Amino acid metabolism", # <--- Beta-alanine mapped here
+      TRUE ~ Subcategory
+    )
+  )
+
+# convert long-format GSEA results into a wide matrix for clustering
+cluster_matrix <- combined_df_annotated %>%
+  select(Description, Analysis_Group, FoldEnrichment) %>%
+  pivot_wider(names_from = Analysis_Group, values_from = FoldEnrichment, values_fill = 0) %>%
+  column_to_rownames("Description")
+
+# compute distance and run hierarchical clustering on the Analysis Groups (columns)
+dist_matrix <- dist(t(as.matrix(cluster_matrix)))
+hc <- hclust(dist_matrix, method = "complete")
+
+# extract the new ordered levels of your Analysis Groups based on the tree
+ordered_groups <- hc$labels[hc$order]
+
+# convert Analysis_Group to a factor
+combined_df_annotated$Analysis_Group <- factor(
+  combined_df_annotated$Analysis_Group, 
+  levels = ordered_groups
+)
+```
+
+Hash out to organize facets alphabetically
+
+```{r cluster-facets}
+module_category_matrix <- combined_df_annotated %>%
+  group_by(Subcategory, Analysis_Group) %>%
+  summarise(FoldEnrichment = mean(FoldEnrichment, na.rm = TRUE), .groups = "drop") %>% #change mean to max etc
+  pivot_wider(names_from = Analysis_Group,values_from = FoldEnrichment,values_fill = 0) %>%
+  column_to_rownames("Subcategory")
+
+module_category_dist <- dist(as.matrix(module_category_matrix))
+
+module_category_hc <- hclust(module_category_dist,method = "complete")
+
+ordered_module_categories <- module_category_hc$labels[module_category_hc$order]
+
+combined_df_annotated <- combined_df_annotated %>%
+  mutate(Subcategory = factor(Subcategory,levels = ordered_module_categories))
+# this is not currently reordering within each facet, fix this later, idk package name, maybe tidytext?
+combined_df_annotated <- combined_df_annotated %>%
+  group_by(Subcategory) %>%
+  mutate(
+    Description = factor(Description, levels = rev(sort(unique(Description))))
+  ) %>%
+  ungroup()
+```
+
+
+## graphing
+
+```{r graph-pathways-padj-enrich}
+
+ggplot(combined_df_annotated, aes(x = Analysis_Group, y = Description)) +
+  geom_point(aes(size = -log10(qvalue), colour = FoldEnrichment)) +
+  scale_colour_viridis_c(option = colour_scale, direction = scale_direction, name = "Fold Enrichment") +
+  scale_size_continuous(name = "-log10(qvalue)", breaks = scales::breaks_pretty(n = 4)) +
+  
+  # Wrap text at ~22 characters so long names break cleanly onto multiple lines
+  facet_grid(
+    rows = vars(Subcategory), 
+    scales = "free_y", 
+    space = "free_y",
+    labeller = labeller(Subcategory = label_wrap_gen(width = 22))
+  ) +
+  
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    
+    # Rotate strip labels to horizontal (angle = 0) and left-align them for readability
+    strip.text.y = element_text(face = "bold", size = 8, angle = 0, hjust = 0),
+    
+    strip.background = element_rect(fill = "grey85"),
+    panel.grid.major.x = element_line(colour = xgrid_colour, linetype = xgrid_linetype),
+    panel.grid.major.y = element_line(colour = ygrid_colour, linetype = ygrid_linetype)
+  ) +
+  labs(
+    x = x_text,
+    y = y_text_p,
+    title = figure_title_p,
+    caption = caption_text_p
+  )
+
+ggsave(file = file.path(save_dir,"kegg_pathway_clustered_a.png"), 
+       width = width_p, height = height_p, dpi = 300)
+```
+
+```{r graph-pathways-count-enrichment}
+
+ggplot(combined_df_annotated, aes(x = Analysis_Group, y = Description)) +
+  geom_point(aes(size = FoldEnrichment, colour = Count)) +
+  scale_colour_viridis_c(option = colour_scale, direction = scale_direction, name = "Gene Count") +
+  scale_size_continuous(name = "Fold Enrichment", breaks = scales::breaks_pretty(n = 4)) +
+  
+  facet_grid(
+    rows = vars(Subcategory), 
+    scales = "free_y", 
+    space = "free_y",
+    labeller = labeller(Subcategory = label_wrap_gen(width = 22))
+  ) +
+  
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    strip.text.y = element_text(face = "bold", size = 8, angle = 0, hjust = 0),
+    strip.background = element_rect(fill = "grey85"),
+    panel.grid.major.x = element_line(colour = xgrid_colour, linetype = xgrid_linetype),
+    panel.grid.major.y = element_line(colour = ygrid_colour, linetype = ygrid_linetype)
+  ) +
+  labs(
+    x = x_text,
+    y = y_text_p,
+    title = figure_title_p,
+    caption = caption_text_p
+  )
+
+ggsave(file = file.path(save_dir,"kegg_pathway_clustered_b.png"), 
+       width = width_p, height = height_p, dpi = 300)
+```
+
+```{r graph-pathways-count-enrichment}
+
+ggplot(combined_df_annotated, aes(x = Analysis_Group, y = Description)) +
+  geom_point(aes(size = Count, colour = -log10(qvalue))) +
+  scale_colour_viridis_c(option = colour_scale, direction = scale_direction, name = "-log10(qvalue)") +
+  scale_size_continuous(name = "Gene Count", breaks = scales::breaks_pretty(n = 4)) +
+  
+  facet_grid(
+    rows = vars(Subcategory), 
+    scales = "free_y", 
+    space = "free_y",
+    labeller = labeller(Subcategory = label_wrap_gen(width = 22))
+  ) +
+  
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    strip.text.y = element_text(face = "bold", size = 8, angle = 0, hjust = 0),
+    strip.background = element_rect(fill = "grey85"),
+    panel.grid.major.x = element_line(colour = xgrid_colour, linetype = xgrid_linetype),
+    panel.grid.major.y = element_line(colour = ygrid_colour, linetype = ygrid_linetype)
+  ) +
+  labs(
+    x = x_text,
+    y = y_text_p,
+    title = figure_title_p,
+    caption = caption_text_p
+  )
+
+ggsave(file = file.path(save_dir,"kegg_pathway_clustered_c.png"), 
+       width = width_p, height = height_p, dpi = 300)
+```
+
+# KEGG MODULES
+
+## ingestion
+
+```{r}
+# read tsv
+folder_path <- file.path(tsv_dir,"KEGG_Module") # 
+files <- list.files(folder_path, pattern = "\\.csv$", full.names = TRUE) # currently using tsvs saves as csv bc librecalc
+combined_mod_df <- bind_rows(lapply(files, read.delim, stringsAsFactors = FALSE))
+
+# extract unique module IDs ("M00001")
+unique_mod_ids <- unique(gsub("path:", "", combined_mod_df$ID))
+
+# get module classification from KEGG REST API
+get_kegg_module_class <- function(mod_id) {
+  url <- paste0("https://rest.kegg.jp/get/", mod_id)
+  tryCatch({
+    lines <- readLines(url, warn = FALSE)
+    class_line <- lines[grep("^CLASS", lines)]
+    if(length(class_line) > 0) {
+      sub_cat <- sub("^CLASS\\s+", "", class_line)
+      return(data.frame(ID = mod_id, Subcategory_Full = sub_cat, stringsAsFactors = FALSE))
+    }
+  }, error = function(e) NULL)
+  return(data.frame(ID = mod_id, Subcategory_Full = "Unmapped", stringsAsFactors = FALSE))
+}
+
+message("Fetching module sub-categories directly from KEGG API...")
+mod_meta_list <- lapply(unique_mod_ids, function(id) {
+  res <- get_kegg_module_class(id)
+  Sys.sleep(0.1) 
+  return(res)
+})
+
+mod_meta <- bind_rows(mod_meta_list) %>%
+  mutate(Subcategory = sub(".*;\\s*", "", Subcategory_Full))
+```
+
+```{r clean-and-cluster}
+# merge module data and clean up categories
+combined_mod_annotated <- combined_mod_df %>%
+  mutate(Clean_ID = gsub("path:", "", ID)) %>%
+  left_join(mod_meta, by = c("Clean_ID" = "ID")) %>%
+  mutate(
+    Subcategory = replace_na(Subcategory, "Other Modules"),
+  # before adding the cluster heirarchical sort, I reformatting the carb metab to come together alphabetically
+#    Subcategory = case_when(
+#      Clean_ID == "M00550" ~ "Carbohydrate metabolism, other",
+#      Clean_ID == "M00009" ~ "Carbohydrate metabolism, central",
+#      Clean_ID == "M00010" ~ "Carbohydrate metabolism, central",
+#      TRUE ~ Subcategory
+#    )
+  )
+
+# heirarchical clustering
+module_matrix <- combined_mod_annotated %>%
+  select(Description, Analysis_Group, FoldEnrichment) %>%
+  pivot_wider(names_from = Analysis_Group, values_from = FoldEnrichment, values_fill = 0) %>%
+  column_to_rownames("Description")
+
+dist_matrix <- dist(t(as.matrix(module_matrix)))
+hc <- hclust(dist_matrix, method = "complete")
+ordered_groups <- hc$labels[hc$order]
+
+combined_mod_annotated$Analysis_Group <- factor(
+  combined_mod_annotated$Analysis_Group, 
+  levels = ordered_groups
+)
+```
+
+Hash out to organize facets alphabetically
+
+```{r cluster-facets}
+module_category_matrix <- combined_mod_annotated %>%
+  group_by(Subcategory, Analysis_Group) %>%
+  summarise(FoldEnrichment = mean(FoldEnrichment, na.rm = TRUE), .groups = "drop") %>% #change mean to max etc
+  pivot_wider(names_from = Analysis_Group,values_from = FoldEnrichment,values_fill = 0) %>%
+  column_to_rownames("Subcategory")
+
+module_category_dist <- dist(as.matrix(module_category_matrix))
+
+module_category_hc <- hclust(module_category_dist,method = "complete")
+
+ordered_module_categories <- module_category_hc$labels[module_category_hc$order]
+
+combined_mod_annotated <- combined_mod_annotated %>%
+  mutate(Subcategory = factor(Subcategory,levels = ordered_module_categories))
+# this is not currently reordering within each facet, fix this later, idk package name, maybe tidytext?
+# for some reason, it seems running this block twice fixes it
+combined_mod_annotated <- combined_mod_annotated %>%
+  group_by(Subcategory) %>%
+  mutate(
+    Description = factor(Description, levels = rev(sort(unique(Description))))
+  ) %>%
+  ungroup()
+```
+
+## graphing
+
+```{r graph-module-padj-enrich}
+ggplot(combined_mod_annotated, aes(x = Analysis_Group, y = Description)) +
+  geom_point(aes(size = -log10(qvalue), colour = FoldEnrichment)) +
+  scale_colour_viridis_c(option = colour_scale, direction = scale_direction, name = "Fold Enrichment") +
+  scale_size_continuous(name = "-log10(qvalue)", breaks = scales::breaks_pretty(n = 4)) +
+  
+  facet_grid(
+    rows = vars(Subcategory), 
+    scales = "free_y", 
+    space = "free_y",
+    labeller = labeller(Subcategory = label_wrap_gen(width = 22))
+  ) +
+  
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    strip.text.y = element_text(face = "bold", size = 8, angle = 0, hjust = 0),
+    strip.background = element_rect(fill = "grey85"),
+    panel.grid.major.x = element_line(colour = xgrid_colour, linetype = xgrid_linetype),
+    panel.grid.major.y = element_line(colour = ygrid_colour, linetype = ygrid_linetype)
+  ) +
+  labs(
+    x = x_text,
+    y = y_text_m,
+    title = figure_title_m,
+    caption = caption_text_m
+  )
+
+ggsave(file = file.path(save_dir, "kegg_modules_clustered_a.png"), 
+       width = width_m, height = height_m, dpi = 300)
+```
+
+
+```{r graph-module-enrich-count}
+ggplot(combined_mod_annotated, aes(x = Analysis_Group, y = Description)) +
+  geom_point(aes(size = Count, colour = FoldEnrichment)) +
+  scale_colour_viridis_c(option = colour_scale, direction = scale_direction, name = "Fold Enrichment") +
+  scale_size_continuous(name = "Gene Count", breaks = scales::breaks_pretty(n = 4)) +
+  
+  facet_grid(
+    rows = vars(Subcategory), 
+    scales = "free_y", 
+    space = "free_y",
+    labeller = labeller(Subcategory = label_wrap_gen(width = 22))
+  ) +
+  
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    strip.text.y = element_text(face = "bold", size = 8, angle = 0, hjust = 0),
+    strip.background = element_rect(fill = "grey85"),
+    panel.grid.major.x = element_line(colour = xgrid_colour, linetype = xgrid_linetype),
+    panel.grid.major.y = element_line(colour = ygrid_colour, linetype = ygrid_linetype)
+  ) +
+  labs(
+    x = x_text,
+    y = y_text_m,
+    title = figure_title_m,
+    caption = caption_text_m
+  )
+
+ggsave(file = file.path(save_dir,"kegg_modules_clustered_b.png"), 
+       width = width_m, height = height_m,  dpi = 300)
+```
+
+
+# COG LETTER CATEGORIES
+
+## ingestion
+
+```{r}
+# Read COG enrichment results
+cog_folder_path <- file.path(tsv_dir, "COG_cat")
+
+cog_files <- list.files(cog_folder_path, pattern = "\\.csv$", full.names = TRUE)
+
+combined_cog_df <- bind_rows(lapply(cog_files, read.delim, stringsAsFactors = FALSE))
+
+
+# Read COG indexing file
+cog_index <- read.csv("/mnt/work-drive/databases/COG-KEGG-data/cog_letter_supercategories.csv",
+  stringsAsFactors = FALSE) %>%
+  rename(
+    COG_Letter = letter,
+    COG_Description = description,
+    COG_Category = category
+)
+
+
+combined_cog_annotated <- combined_cog_df %>%
+  left_join(cog_index,by = c("ID" = "COG_Letter")) %>%
+  mutate(
+    Description = COG_Description,
+    Subcategory = COG_Category
+  )
+
+```
+
+```{r}
+# Hierarchical clustering of COG enrichment profiles
+cog_matrix <- combined_cog_annotated %>%
+  select(Description, Analysis_Group, FoldEnrichment) %>%
+  pivot_wider(
+    names_from = Analysis_Group,
+    values_from = FoldEnrichment,
+    values_fill = 0
+  ) %>%
+  column_to_rownames("Description")
+
+
+cog_dist_matrix <- dist(t(as.matrix(cog_matrix)))
+
+cog_hc <- hclust(cog_dist_matrix,method = "complete")
+
+ordered_cog_groups <- cog_hc$labels[cog_hc$order]
+
+
+combined_cog_annotated$Analysis_Group <- factor(
+  combined_cog_annotated$Analysis_Group,
+  levels = ordered_cog_groups
+)
+
+```
+Hash out to organize facets alphabetically
+
+```{r cluster-facets}
+module_category_matrix <- combined_cog_annotated %>%
+  group_by(Subcategory, Analysis_Group) %>%
+  summarise(FoldEnrichment = mean(FoldEnrichment, na.rm = TRUE), .groups = "drop") %>% #change mean to max etc
+  pivot_wider(names_from = Analysis_Group,values_from = FoldEnrichment,values_fill = 0) %>%
+  column_to_rownames("Subcategory")
+
+module_category_dist <- dist(as.matrix(module_category_matrix))
+
+module_category_hc <- hclust(module_category_dist,method = "complete")
+
+ordered_module_categories <- module_category_hc$labels[module_category_hc$order]
+
+combined_mod_annotated <- combined_cog_annotated %>%
+  mutate(Subcategory = factor(Subcategory,levels = ordered_module_categories))
+# this is not currently reordering within each facet, fix this later, idk package name, maybe tidytext?
+# for some reason, it seems running this block twice fixes it
+combined_cog_annotated <- combined_cog_annotated %>%
+  group_by(Subcategory) %>%
+  mutate(
+    Description = factor(Description, levels = rev(sort(unique(Description))))
+  ) %>%
+  ungroup()
+```
+
+## graphing
+
+```{r graph-cog-let-padj-enrich}
+ggplot(combined_cog_annotated, aes(x = Analysis_Group, y = Description)) +
+  geom_point(aes(size = -log10(qvalue), colour = FoldEnrichment)) +
+  scale_colour_viridis_c(option = colour_scale, direction = scale_direction, name = "Fold Enrichment") +
+  scale_size_continuous( name = "-log10(qvalue)", breaks = scales::breaks_pretty(n = 4)) +
+  
+  facet_grid(
+    rows = vars(Subcategory), 
+    scales = "free_y", 
+    space = "free_y",
+    labeller = labeller(Subcategory = label_wrap_gen(width = 22))
+  ) +
+  
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    strip.text.y = element_text(face = "bold", size = 8, angle = 0, hjust = 0),
+    strip.background = element_rect(fill = "grey85"),
+    panel.grid.major.x = element_line(colour = xgrid_colour, linetype = xgrid_linetype),
+    panel.grid.major.y = element_line(colour = ygrid_colour, linetype = ygrid_linetype)
+  ) +
+  labs(
+    x = x_text,
+    y = y_text_c,
+    title = figure_title_c,
+    caption = caption_text_c
+  )
+
+ggsave(file = file.path(save_dir, "cog_letters_clustered_a.png"), 
+       width = width_c, height = height_c, dpi = 300)
+```
+
+
+```{r graph-cog-let-count-enrich}
+ggplot(combined_cog_annotated, aes(x = Analysis_Group, y = Description)) +
+  geom_point(aes(size = Count, colour = FoldEnrichment)) +
+  scale_colour_viridis_c(option = colour_scale, direction = scale_direction, name = "FoldEnrichment") +
+  scale_size_continuous(name = "Gene Count", breaks = scales::breaks_pretty(n = 4)) +
+  
+  facet_grid(
+    rows = vars(Subcategory), 
+    scales = "free_y", 
+    space = "free_y",
+    labeller = labeller(Subcategory = label_wrap_gen(width = 22))
+  ) +
+  
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    strip.text.y = element_text(face = "bold", size = 8, angle = 0, hjust = 0),
+    strip.background = element_rect(fill = "grey85"),
+    panel.grid.major.x = element_line(colour = xgrid_colour, linetype = xgrid_linetype),
+    panel.grid.major.y = element_line(colour = ygrid_colour, linetype = ygrid_linetype)
+  ) +
+  labs(
+    x = x_text,
+    y = y_text_c,
+    title = figure_title_c,
+    caption = caption_text_c
+  )
+
+ggsave(file = file.path(save_dir, "cog_letters_clustered_b.png"), 
+       width = width_c, height = height_c, dpi = 300)
+```
+
+
+```{r graph-cog-let-count-sig}
+ggplot(combined_cog_annotated, aes(x = Analysis_Group, y = Description)) +
+  geom_point(aes(size = Count, colour = -log10(qvalue))) +
+  scale_colour_viridis_c(option = colour_scale, direction = scale_direction, name = "-log10(qvalue)") +
+  scale_size_continuous(name = "Gene Count", breaks = scales::breaks_pretty(n = 4)) +
+  
+  facet_grid(
+    rows = vars(Subcategory), 
+    scales = "free_y", 
+    space = "free_y",
+    labeller = labeller(Subcategory = label_wrap_gen(width = 22))
+  ) +
+  
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    strip.text.y = element_text(face = "bold", size = 8, angle = 0, hjust = 0),
+    strip.background = element_rect(fill = "grey85"),
+    panel.grid.major.x = element_line(colour = xgrid_colour, linetype = xgrid_linetype),
+    panel.grid.major.y = element_line(colour = ygrid_colour, linetype = ygrid_linetype)
+  ) +
+  labs(
+    x = x_text,
+    y = y_text_c,
+    title = figure_title_c,
+    caption = caption_text_c
+  )
+
+ggsave(file = file.path(save_dir, "cog_letters_clustered_c.png"), 
+       width = width_c, height = height_c, dpi = 300)
+```

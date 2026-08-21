@@ -1,0 +1,233 @@
+---
+title: "Untitled"
+author: "Kira Goff"
+date: "2026-08-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(plotly)
+```
+
+
+```{r}
+res_exposure <- read.csv("results/res_exposure.csv") 
+res_time_exposure <- read.csv("results/res_interaction.csv")
+annotations <- read.csv("peri-anno-definitions.tsv", sep = "\t")
+```
+
+```{r}
+scatter_df <- res_exposure %>%
+  select(gene_id, exposure_log2FC = log2FoldChange, exposure_padj = padj
+  ) %>%
+  full_join(
+    res_time_exposure %>%
+      select(gene_id, interaction_log2FC = log2FoldChange, interaction_padj = padj),by = "gene_id"
+  )
+
+
+scatter_df <- scatter_df %>%
+  left_join(annotations, by = c("gene_id" = "locus_tag"))
+
+```
+
+
+```{r}
+scatter_df <- scatter_df %>%
+  mutate(significance = case_when(
+      exposure_padj < 0.05 & interaction_padj < 0.05 ~ "Both", 
+      exposure_padj < 0.05 ~ "Exposure",
+      interaction_padj < 0.05 ~ "Time:Exposure",
+      TRUE ~ "Neither"
+      )
+      )
+
+scatter_df <- scatter_df %>%
+  mutate(
+    significance = factor(
+      significance,
+      levels = c(
+        "Neither",
+        "Exposure",
+        "Time:Exposure",
+        "Both"
+      )
+    )
+  )
+
+
+```
+
+```{r}
+ggplot() +
+  # Non-significant genes first
+  geom_point(
+    data = filter(scatter_df, significance == "Neither"),
+    aes(x = exposure_log2FC, y = interaction_log2FC),
+    colour = "grey85",
+    size = 1.2,
+    alpha = 0.3
+  ) +
+  # Significant genes on top
+  geom_point(
+    data = filter(scatter_df, significance != "Neither"),
+    aes(x = exposure_log2FC, y = interaction_log2FC, colour = significance),
+    size = 1.8,
+    alpha = 0.8
+  ) +
+  
+  scale_colour_manual(
+    values = c(
+      "Exposure" = "#edae49",
+      "Time:Exposure" = "#d1495b",
+      "Both" = "#00798c"
+    )
+  ) +
+  
+  geom_hline(
+    yintercept = 0,
+    colour = "grey60",
+    linewidth = 0.4
+  ) +
+  geom_vline(
+    xintercept = 0,
+    colour = "grey60",
+    linewidth = 0.4
+  ) +
+  
+  theme_bw(base_size = 11) +
+  
+  labs(
+    x = "Exposure log2 Fold Change",
+    y = "Time:Exposure log2 Fold Change",
+    colour = "Significance"
+  )
+ggsave("results/07-additional-vis/scatterbase.png")
+
+```
+
+```{r}
+
+scatter_df <- scatter_df %>%
+  mutate(
+    hover_text = paste0(
+      "<b>", gene_id, "</b>",
+      "<br>Gene: ", ifelse(is.na(Gene), "NA", Gene),
+      "<br>Product: ", ifelse(is.na(Product), "NA", Product),
+      "<br>Exposure log2FC: ", round(exposure_log2FC, 3),
+      "<br>Exposure padj: ", signif(exposure_padj, 3),
+      "<br>Time:Exposure log2FC: ", round(interaction_log2FC, 3),
+      "<br>Time:Exposure padj: ", signif(interaction_padj, 3),
+      "<br>COG Letter: ", ifelse(is.na(COG_cat_def), "NA", COG_cat_def),
+      "<br>KO: ", ifelse(is.na(KO), "NA", KO),
+      "<br>KO def: ", ifelse(is.na(KO_def), "NA", KO_def),
+      "<br>CANT-HYD: ", ifelse(is.na(`cant.hyd`), "NA", `cant.hyd`)
+    )
+  )
+
+
+p <- ggplot() +
+  
+  # Non-significant genes first
+  geom_point(
+    data = filter(scatter_df, significance == "Neither"),
+    aes(
+      x = exposure_log2FC,
+      y = interaction_log2FC,
+      text = hover_text
+    ),
+    colour = "grey85",
+    size = 1.2,
+    alpha = 0.3
+  ) +
+  
+  # Significant genes on top
+  geom_point(
+    data = filter(scatter_df, significance != "Neither"),
+    aes(
+      x = exposure_log2FC,
+      y = interaction_log2FC,
+      colour = significance,
+      text = hover_text
+    ),
+    size = 1.8,
+    alpha = 0.8
+  ) +
+  
+  scale_colour_manual(
+    values = c(
+      "Exposure" = "#edae49",
+      "Time:Exposure" = "#d1495b",
+      "Both" = "#00798c"
+    )
+  ) +
+  
+  geom_hline(
+    yintercept = 0,
+    colour = "grey60",
+    linewidth = 0.4
+  ) +
+  
+  geom_vline(
+    xintercept = 0,
+    colour = "grey60",
+    linewidth = 0.4
+  ) +
+  
+  theme_bw(base_size = 11) +
+  
+  labs(
+    x = "Exposure log2 Fold Change",
+    y = "Time:Exposure log2 Fold Change",
+    colour = "Significance"
+  )
+
+```
+
+```{r}
+scatter_df <- scatter_df %>%
+  mutate(
+    significance = case_when(
+      exposure_padj < 0.05 & interaction_padj < 0.05 ~ "Both",
+      exposure_padj < 0.05 ~ "Exposure",
+      interaction_padj < 0.05 ~ "Time:Exposure",
+      TRUE ~ "Neither"
+    ),
+    significance = factor(
+      significance,
+      levels = c(
+        "Neither",
+        "Exposure",
+        "Time:Exposure",
+        "Both"
+      )
+    )
+  )
+
+```
+
+
+```{r}
+ggplotly(
+  p,
+  tooltip = "text"
+)
+
+```
+
+
+
+```{r}
+saveRDS(
+  scatter_df,
+  "results/07-additional-vis/scatter_df.rds"
+)
+
+```
+
