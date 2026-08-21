@@ -27,8 +27,8 @@ library(KEGGREST)       # Client interface to the KEGG REST API
 
 ```{r define-paths}
 base_dir <- "./"
-base_results <- "./results"
-results_dir <- "./results/05-mahalanobis-distance"
+base_results <- "./results2"
+results_dir <- "./results2/05-mahalanobis-distance"
 
 if (!dir.exists(results_dir)) {
   dir.create(results_dir, recursive = TRUE)
@@ -652,3 +652,9 @@ for (target_db in target_databases) {
 
 message("\n*** COG/COGcat functional enrichment runs completed! ***")
 ```
+
+```{r}
+write.csv(df_final_clusters,"final_clusters.csv")
+write.csv(anno_operon_clean,"operon_clean.csv")
+```
+

@@ -33,7 +33,6 @@ library(enrichplot)
 library(httr)
 library(jsonlite)
 
-results_dir <- "/mnt/work-drive/kira/deseq2New/final-split"
 library(pheatmap)
 library(dplyr)
 library(tidyr)
@@ -42,8 +41,8 @@ library(tidyr)
 
 ```{r pre-cleanup}
 base_dir <- "./"
-base_results <- "./results"
-results_dir <- "./results/04-cluster-enrichment-check"
+base_results <- "./results2"
+results_dir <- "./results2/04-cluster-enrichment-check-non-auto"
 lookup_dir <- "./lookups"
 
 ifelse(!dir.exists(file.path(results_dir)),
@@ -116,10 +115,10 @@ This saves the data in three ways: by enrichment term, by gene, and as a +/- mat
 
 ```{r cluster-enrichment}
 # ----- Definitions -----
-target_db <- "kRxn" # Options: "KO", "kPathway", "kModule", "kRxn", "COG", "COGcat"
+target_db <- "COGcat" # Options: "KO", "kPathway", "kModule", "kRxn", "COG", "COGcat"
 
 # Threshold variables for output table
-qtable <- 0.3 # q threshold for out table
+qtable <- 0.2 # q threshold for out table
 
 clust_thresh <- 0.25 # Baseline cluster membership threshold
 lfc_rescue <- 1 # Log2 Fold Change fallback rescue threshold
@@ -568,3 +567,538 @@ if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
 }
 print(p_cont)
 ```
+
+Let's try the heatmaps in complexheatmap with seriation
+# TO DO: fix clustering implimentaton 
+
+```{r}
+#install.packages("seriation")
+
+library(ComplexHeatmap)
+library(seriation)
+library(vegan)
+```
+
+
+```{r olo}
+# ----- hierarchically clustered heatmap with continuous dynamic range -----
+
+if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
+  
+  # 1. Transform the dynamic bubble-plot data into a continuous numeric matrix
+  continuous_matrix <- final_enrichment_df %>%
+    mutate(Signal_Strength = -log10(qvalue)) %>%
+    mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+    select(Row_Label, Analysis_Group, Signal_Strength) %>%
+    distinct() %>%
+    pivot_wider(
+      names_from = Analysis_Group,
+      values_from = Signal_Strength,
+      values_fill = 0
+    ) %>%
+    tibble::column_to_rownames("Row_Label") %>%
+    as.matrix()
+  
+  # 1. Transform the dynamic bubble-plot data into a continuous numeric matrix
+  continuous_matrix <- final_enrichment_df %>%
+    mutate(Signal_Strength = -log10(qvalue)) %>%
+    mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+    select(Row_Label, Analysis_Group, Signal_Strength) %>%
+    distinct() %>%
+    pivot_wider(
+      names_from = Analysis_Group,
+      values_from = Signal_Strength,
+      values_fill = 0
+    ) %>%
+    tibble::column_to_rownames("Row_Label") %>%
+    as.matrix()
+
+  # --- NEW: Cap extreme outliers to protect the color scale ---
+  # Find the 95th (or 99th) percentile value of the non-zero data
+  cap_threshold <- quantile(continuous_matrix[continuous_matrix > 0], 0.95, na.rm = TRUE)
+  
+  # Apply the cap: anything higher than the threshold gets set to the threshold
+  continuous_matrix[continuous_matrix > cap_threshold] <- cap_threshold
+  message(sprintf("Notice: Capping outlier values at a maximum -log10(p.adj) of %.2f to preserve color dynamic range.", cap_threshold))
+  # -------------------------------------------------------------
+
+  # 2. Filter down to the most informative terms to avoid visual crowding
+  if (nrow(continuous_matrix) > 50) {
+    message("Notice: Subsetting heatmap to the top 50 terms with the highest profile variance.")
+    row_variances <- apply(continuous_matrix, 1, var)
+    continuous_matrix <- continuous_matrix[order(-row_variances)[1:50], , drop = FALSE]
+  }
+
+  # 3. Define output path (PNG extension)
+  heatmap_continuous_name <- sprintf("enrichment_continuous_heatmap_%s_m%.2f-bc-olo.png", db_label, clust_thresh)
+  heatmap_continuous_path <- file.path(results_dir, "reshaped_outputs", heatmap_continuous_name)
+
+  # 4. Pre-calculate Clustering using Bray-Curtis + OLO
+  # Row clustering (vegdist handles the zero-heavy rows beautifully)
+  row_dist <- vegan::vegdist(continuous_matrix, method = "bray")
+  row_hc   <- hclust(row_dist, method = "complete")
+  row_olo  <- reorder(row_hc, row_dist, method = "OLO")
+  row_dend <- as.dendrogram(row_olo)
+
+  # Column clustering 
+  col_dist <- vegan::vegdist(t(continuous_matrix), method = "bray")
+  col_hc   <- hclust(col_dist, method = "complete")
+  col_olo  <- reorder(col_hc, col_dist, method = "OLO")
+  col_dend <- as.dendrogram(col_olo)
+
+  # Define color mapping explicitly
+  col_fun <- circlize::colorRamp2(
+    seq(0, max(continuous_matrix, na.rm = TRUE), length.out = 3), 
+    c("#f0f0f0", "#fe9929", "#800026")
+  )
+
+  # 5. Construct the Heatmap object
+  p_cont <- Heatmap(
+    matrix = continuous_matrix,
+    col = col_fun,
+    name = "-log10(p.adj)",
+    column_title = sprintf("Clustered Enrichment Intensity [-log10(p.adj)]: %s", target_db),
+    cluster_rows = row_dend,
+    cluster_columns = col_dend,
+    rect_gp = gpar(col = "white", lwd = 1), 
+    row_names_gp = gpar(fontsize = 8),      
+    column_names_gp = gpar(fontsize = 10),  
+    row_dend_width = unit(15, "mm"),
+    column_dend_height = unit(15, "mm")
+  )
+
+  # 6. Open a high-resolution PNG device and write the plot
+  calc_height <- max(6, nrow(continuous_matrix) * 0.22)
+  
+  png(filename = heatmap_continuous_path, 
+      width = 8, 
+      height = calc_height, 
+      units = "in", 
+      res = 300) # Crisp, publication-quality 300 DPI
+  
+  ComplexHeatmap::draw(p_cont)
+  
+  dev.off() # Close the PNG file device safely
+
+  message(sprintf("Continuous Heatmap Success! Saved PNG to: %s", file.path("reshaped_outputs", heatmap_continuous_name)))
+
+} else {
+  message("Skipping Continuous Heatmap: No data available.") 
+}
+
+# This will draw it cleanly inline inside your R Markdown notebook console pane
+if (exists("p_cont")) {
+  ComplexHeatmap::draw(p_cont)
+}
+```
+
+
+```{r}
+# ----- hierarchically clustered heatmap with continuous dynamic range -----
+
+if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
+  
+  # 1. Transform the dynamic bubble-plot data into a continuous numeric matrix
+  continuous_matrix <- final_enrichment_df %>%
+    mutate(Signal_Strength = -log10(qvalue)) %>%
+    mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+    select(Row_Label, Analysis_Group, Signal_Strength) %>%
+    distinct() %>%
+    pivot_wider(
+      names_from = Analysis_Group,
+      values_from = Signal_Strength,
+      values_fill = 0
+    ) %>%
+    tibble::column_to_rownames("Row_Label") %>%
+    as.matrix()
+
+  # --- NEW: Cap extreme outliers to protect the color scale ---
+  cap_threshold <- quantile(continuous_matrix[continuous_matrix > 0], 0.95, na.rm = TRUE)
+  continuous_matrix[continuous_matrix > cap_threshold] <- cap_threshold
+  message(sprintf("Notice: Capping outlier values at a maximum -log10(p.adj) of %.2f to preserve color dynamic range.", cap_threshold))
+  # -------------------------------------------------------------
+
+  # 2. Filter down to the most informative terms to avoid visual crowding
+  if (nrow(continuous_matrix) > 50) {
+    message("Notice: Subsetting heatmap to the top 50 terms with the highest profile variance.")
+    row_variances <- apply(continuous_matrix, 1, var)
+    continuous_matrix <- continuous_matrix[order(-row_variances)[1:50], , drop = FALSE]
+  }
+
+  # 3. Define output path (PNG extension)
+  heatmap_continuous_name <- sprintf("enrichment_continuous_heatmap_%s_m%.2f-bc-mds.png", db_label, clust_thresh)
+  heatmap_continuous_path <- file.path(results_dir, "reshaped_outputs", heatmap_continuous_name)
+
+# ----- Advanced Ordination: Bray-Curtis Distance + PCoA (MDS) -----
+  
+  # 1. Clean the matrix: Remove any rows or columns that are entirely zero
+  #    (which cause division-by-zero NaNs in Bray-Curtis calculations)
+  valid_rows <- rowSums(continuous_matrix, na.rm = TRUE) > 0
+  valid_cols <- colSums(continuous_matrix, na.rm = TRUE) > 0
+  
+  clean_matrix <- continuous_matrix[valid_rows, valid_cols, drop = FALSE]
+  
+  # Fail-safe check to ensure we still have data left to plot
+  if (nrow(clean_matrix) < 2 || ncol(clean_matrix) < 2) {
+    stop("Error: Not enough non-zero data remaining to calculate distances after filtering empty rows/columns.")
+  }
+
+  # 2. Calculate Bray-Curtis distance on the clean data
+  row_dist <- vegan::vegdist(clean_matrix, method = "bray")
+  col_dist <- vegan::vegdist(t(clean_matrix), method = "bray")
+
+  # 3. Run Multidimensional Scaling (PCoA)
+  row_mds  <- seriation::seriate(row_dist, method = "MDS")
+  col_mds  <- seriation::seriate(col_dist, method = "MDS")
+
+  # 4. Extract the clean, linear trajectory index order
+  ordered_pathways <- rownames(clean_matrix)[seriation::get_order(row_mds)]
+  ordered_clusters <- colnames(clean_matrix)[seriation::get_order(col_mds)]
+  
+  # 5. Manually reorder the cleaned matrix using the MDS paths
+  continuous_matrix_ordered <- clean_matrix[ordered_pathways, ordered_clusters, drop = FALSE]
+  # Define color mapping explicitly
+  col_fun <- circlize::colorRamp2(
+    seq(0, max(continuous_matrix_ordered, na.rm = TRUE), length.out = 3), 
+    c("#f0f0f0", "#fe9929", "#800026")
+  )
+
+  # 5. Construct the Heatmap object
+  # FIX: Set cluster_rows and cluster_columns to FALSE since we pre-ordered the matrix
+  p_cont <- ComplexHeatmap::Heatmap(
+    matrix = continuous_matrix_ordered,
+    col = col_fun,
+    name = "-log10(p.adj)",
+    column_title = sprintf("Clustered Enrichment Intensity [-log10(p.adj)]: %s", target_db),
+    cluster_rows = FALSE,      
+    cluster_columns = FALSE,   
+    rect_gp = gpar(col = "white", lwd = 1), 
+    row_names_gp = gpar(fontsize = 8),      
+    column_names_gp = gpar(fontsize = 10)
+  )
+
+  # 6. Open a high-resolution PNG device and write the plot
+  calc_height <- max(6, nrow(continuous_matrix_ordered) * 0.22)
+  
+  png(filename = heatmap_continuous_path, 
+      width = 8, 
+      height = calc_height, 
+      units = "in", 
+      res = 300) # Crisp, publication-quality 300 DPI
+  
+  ComplexHeatmap::draw(p_cont)
+  
+  dev.off() # Close the PNG file device safely
+
+  message(sprintf("Continuous Heatmap Success! Saved PNG to: %s", file.path("reshaped_outputs", heatmap_continuous_name)))
+
+} else {
+  message("Skipping Continuous Heatmap: No data available.") 
+}
+
+# Draw cleanly inline inside your R Markdown notebook console pane
+if (exists("p_cont")) {
+  ComplexHeatmap::draw(p_cont)
+}
+```
+
+
+```{r olo}
+# ----- hierarchically clustered heatmap with continuous dynamic range -----
+
+if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
+  
+  # 1. Transform the dynamic bubble-plot data into a continuous numeric matrix
+  continuous_matrix <- final_enrichment_df %>%
+    mutate(Signal_Strength = -log10(qvalue)) %>%
+    mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+    select(Row_Label, Analysis_Group, Signal_Strength) %>%
+    distinct() %>%
+    pivot_wider(
+      names_from = Analysis_Group,
+      values_from = Signal_Strength,
+      values_fill = 0
+    ) %>%
+    tibble::column_to_rownames("Row_Label") %>%
+    as.matrix()
+  
+  # 1. Transform the dynamic bubble-plot data into a continuous numeric matrix
+  continuous_matrix <- final_enrichment_df %>%
+    mutate(Signal_Strength = -log10(qvalue)) %>%
+    mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+    select(Row_Label, Analysis_Group, Signal_Strength) %>%
+    distinct() %>%
+    pivot_wider(
+      names_from = Analysis_Group,
+      values_from = Signal_Strength,
+      values_fill = 0
+    ) %>%
+    tibble::column_to_rownames("Row_Label") %>%
+    as.matrix()
+
+  # --- NEW: Cap extreme outliers to protect the color scale ---
+  # Find the 95th (or 99th) percentile value of the non-zero data
+  cap_threshold <- quantile(continuous_matrix[continuous_matrix > 0], 0.95, na.rm = TRUE)
+  
+  # Apply the cap: anything higher than the threshold gets set to the threshold
+  continuous_matrix[continuous_matrix > cap_threshold] <- cap_threshold
+  message(sprintf("Notice: Capping outlier values at a maximum -log10(p.adj) of %.2f to preserve color dynamic range.", cap_threshold))
+  # -------------------------------------------------------------
+
+  # 2. Filter down to the most informative terms to avoid visual crowding
+  if (nrow(continuous_matrix) > 50) {
+    message("Notice: Subsetting heatmap to the top 50 terms with the highest profile variance.")
+    row_variances <- apply(continuous_matrix, 1, var)
+    continuous_matrix <- continuous_matrix[order(-row_variances)[1:50], , drop = FALSE]
+  }
+
+  # 3. Define output path (PNG extension)
+  heatmap_continuous_name <- sprintf("enrichment_continuous_heatmap_%s_m%.2f-bc-olo.png", db_label, clust_thresh)
+  heatmap_continuous_path <- file.path(results_dir, "reshaped_outputs", heatmap_continuous_name)
+
+  # 4. Pre-calculate Clustering using Bray-Curtis + OLO
+  # Row clustering (vegdist handles the zero-heavy rows beautifully)
+  row_dist <- vegan::vegdist(continuous_matrix, method = "bray")
+  row_hc   <- hclust(row_dist, method = "complete")
+  row_olo  <- reorder(row_hc, row_dist, method = "OLO")
+  row_dend <- as.dendrogram(row_olo)
+
+  # Column clustering 
+  col_dist <- vegan::vegdist(t(continuous_matrix), method = "bray")
+  col_hc   <- hclust(col_dist, method = "complete")
+  col_olo  <- reorder(col_hc, col_dist, method = "OLO")
+  col_dend <- as.dendrogram(col_olo)
+
+  # Define color mapping explicitly
+  col_fun <- circlize::colorRamp2(
+    seq(0, max(continuous_matrix, na.rm = TRUE), length.out = 3), 
+    c("#f0f0f0", "#fe9929", "#800026")
+  )
+
+  # 5. Construct the Heatmap object
+  p_cont <- Heatmap(
+    matrix = continuous_matrix,
+    col = col_fun,
+    name = "-log10(p.adj)",
+    column_title = sprintf("Clustered Enrichment Intensity [-log10(p.adj)]: %s", target_db),
+    cluster_rows = row_dend,
+    cluster_columns = col_dend,
+    rect_gp = gpar(col = "white", lwd = 1), 
+    row_names_gp = gpar(fontsize = 8),      
+    column_names_gp = gpar(fontsize = 10),  
+    row_dend_width = unit(15, "mm"),
+    column_dend_height = unit(15, "mm")
+  )
+
+  # 6. Open a high-resolution PNG device and write the plot
+  calc_height <- max(6, nrow(continuous_matrix) * 0.22)
+  
+  png(filename = heatmap_continuous_path, 
+      width = 8, 
+      height = calc_height, 
+      units = "in", 
+      res = 300) # Crisp, publication-quality 300 DPI
+  
+  ComplexHeatmap::draw(p_cont)
+  
+  dev.off() # Close the PNG file device safely
+
+  message(sprintf("Continuous Heatmap Success! Saved PNG to: %s", file.path("reshaped_outputs", heatmap_continuous_name)))
+
+} else {
+  message("Skipping Continuous Heatmap: No data available.") 
+}
+
+# This will draw it cleanly inline inside your R Markdown notebook console pane
+if (exists("p_cont")) {
+  ComplexHeatmap::draw(p_cont)
+}
+```
+
+```{r}
+if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
+  
+
+  # ----- filter and prepare data -----
+  # Generate matrix
+  matrix_prep <- final_enrichment_df %>%
+    mutate(Signal = -log10(qvalue)) %>%
+    mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+    select(Row_Label, Analysis_Group, Signal) %>%
+    distinct() %>%
+    pivot_wider(names_from = Analysis_Group, values_from = Signal, values_fill = 0)
+
+  # Filter down to top 50 rows based on variance to keep the dot plot clean
+  if (nrow(matrix_prep) > 50) {
+    row_vars <- apply(as.matrix(matrix_prep[, -1]), 1, var)
+    matrix_prep <- matrix_prep[order(-row_vars)[1:50], ]
+  }
+
+  # ----- generate clustering matrix & handle outliers -----
+  # convert to pure matrix format for clustering calculations
+  clust_matrix <- as.matrix(matrix_prep[, -1])
+  rownames(clust_matrix) <- matrix_prep$Row_Label
+
+  # NEW: Dynamic 95th percentile outlier cap to preserve the visual color gradient
+  cap_val <- quantile(clust_matrix[clust_matrix > 0], 0.95, na.rm = TRUE)
+  clust_matrix[clust_matrix > cap_val] <- cap_val
+  message(sprintf("Notice: Capping outlier values at a maximum -log10(qvalue) of %.2f for sorting.", cap_val))
+
+# ----- Advanced Ordination: Bray-Curtis Distance + PCoA (MDS) -----
+
+  
+
+  # 1. Calculate Bray-Curtis distance matrices
+  row_dist <- vegan::vegdist(clust_matrix, method = "bray")
+  col_dist <- vegan::vegdist(t(clust_matrix), method = "bray")
+
+  # 2. Run Multidimensional Scaling (PCoA) to find the primary continuous gradient
+  row_mds  <- seriation::seriate(row_dist, method = "MDS")
+  col_mds  <- seriation::seriate(col_dist, method = "MDS")
+
+  # 3. Extract the clean, linear trajectory index order
+  ordered_pathways <- rownames(clust_matrix)[seriation::get_order(row_mds)]
+  ordered_clusters <- colnames(clust_matrix)[seriation::get_order(col_mds)]
+  # ----- generate ordered dotplot -----
+  hier_dotplot <- ggplot(plot_data_clustered, aes(x = Analysis_Group, y = Row_Label)) +
+    # Updated color aesthetic to use our capped 'Plot_Signal' column
+    geom_point(aes(size = Count, color = Plot_Signal)) +
+    scale_color_viridis_c(
+      name = paste0("-log10(qvalue)\n(capped at ", round(cap_val, 1), ")"), 
+      option = "magma", 
+      direction = 1
+    ) +
+    scale_size_continuous(name = "Gene Count", range = c(3, 8)) +
+    theme_bw(base_size = 11) +
+    labs(
+      title = sprintf("Hierarchical Dot Plot Profile (%s)", target_db),
+      subtitle = "Axes arranged via Bray-Curtis Dissimilarity & OLO Seriation",
+      x = "Analysis Clusters (Clustered)",
+      y = "Enriched Functional Terms (Clustered)"
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+      axis.text.y = element_text(size = 9),
+      panel.grid.major = element_line(color = "gray95"),
+      plot.title = element_text(face = "bold", size = 14)
+    )
+
+  # ----- dynamic save -----
+  dot_out_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_hierarchical_dotplot-bc-OLO.png", db_label, clust_thresh, lfc_rescue, n_clusters)
+  dot_out_path <- file.path(results_dir, dot_out_name)
+
+  dynamic_height <- max(5, length(ordered_pathways) * 0.22)
+
+  ggsave(
+    filename = dot_out_path,
+    plot = hier_dotplot,
+    width = 9,
+    height = dynamic_height,
+    dpi = 300,
+    bg = "white"
+  )
+
+  message(sprintf("Hierarchical Dot Plot Success! Saved to: %s", file.path(dot_out_name)))
+  print(hier_dotplot)
+} else {
+  message("Skipping Visualization: No matching enrichment data available.") 
+}
+```
+
+
+```{r}
+if (exists("final_enrichment_df") && nrow(final_enrichment_df) > 0) {
+  
+
+  # ----- filter and prepare data -----
+  # Generate matrix
+  matrix_prep <- final_enrichment_df %>%
+    mutate(Signal = -log10(qvalue)) %>%
+    mutate(Row_Label = sprintf("%s: %s", ID, substr(Description, 1, 40))) %>%
+    select(Row_Label, Analysis_Group, Signal) %>%
+    distinct() %>%
+    pivot_wider(names_from = Analysis_Group, values_from = Signal, values_fill = 0)
+
+  # Filter down to top 50 rows based on variance to keep the dot plot clean
+  if (nrow(matrix_prep) > 50) {
+    row_vars <- apply(as.matrix(matrix_prep[, -1]), 1, var)
+    matrix_prep <- matrix_prep[order(-row_vars)[1:50], ]
+  }
+
+  # ----- generate clustering matrix & handle outliers -----
+  # convert to pure matrix format for clustering calculations
+  clust_matrix <- as.matrix(matrix_prep[, -1])
+  rownames(clust_matrix) <- matrix_prep$Row_Label
+
+  # NEW: Dynamic 95th percentile outlier cap to preserve the visual color gradient
+  cap_val <- quantile(clust_matrix[clust_matrix > 0], 0.95, na.rm = TRUE)
+  clust_matrix[clust_matrix > cap_val] <- cap_val
+  message(sprintf("Notice: Capping outlier values at a maximum -log10(qvalue) of %.2f for sorting.", cap_val))
+
+# ----- Advanced Ordination: Bray-Curtis Distance + PCoA (MDS) -----
+
+  
+
+  # 1. Calculate Bray-Curtis distance matrices
+  row_dist <- vegan::vegdist(clust_matrix, method = "bray")
+  col_dist <- vegan::vegdist(t(clust_matrix), method = "bray")
+
+  # 2. Run Multidimensional Scaling (PCoA) to find the primary continuous gradient
+  row_mds  <- seriation::seriate(row_dist, method = "MDS")
+  col_mds  <- seriation::seriate(col_dist, method = "MDS")
+
+  # 3. Extract the clean, linear trajectory index order
+  ordered_pathways <- rownames(clust_matrix)[seriation::get_order(row_mds)]
+  ordered_clusters <- colnames(clust_matrix)[seriation::get_order(col_mds)]
+  # ----- generate ordered dotplot -----
+  hier_dotplot <- ggplot(plot_data_clustered, aes(x = Analysis_Group, y = Row_Label)) +
+    # Updated color aesthetic to use our capped 'Plot_Signal' column
+    geom_point(aes(size = Count, color = Plot_Signal)) +
+    scale_color_viridis_c(
+      name = paste0("-log10(qvalue)\n(capped at ", round(cap_val, 1), ")"), 
+      option = "magma", 
+      direction = 1
+    ) +
+    scale_size_continuous(name = "Gene Count", range = c(3, 8)) +
+    theme_bw(base_size = 11) +
+    labs(
+      title = sprintf("Hierarchical Dot Plot Profile (%s)", target_db),
+      subtitle = "Axes arranged via Bray-Curtis Dissimilarity & OLO Seriation",
+      x = "Analysis Clusters (Clustered)",
+      y = "Enriched Functional Terms (Clustered)"
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+      axis.text.y = element_text(size = 9),
+      panel.grid.major = element_line(color = "gray95"),
+      plot.title = element_text(face = "bold", size = 14)
+    )
+
+  # ----- dynamic save -----
+  dot_out_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_hierarchical_dotplot-bc-mds.png", db_label, clust_thresh, lfc_rescue, n_clusters)
+  dot_out_path <- file.path(results_dir, dot_out_name)
+
+  dynamic_height <- max(5, length(ordered_pathways) * 0.22)
+
+  ggsave(
+    filename = dot_out_path,
+    plot = hier_dotplot,
+    width = 9,
+    height = dynamic_height,
+    dpi = 300,
+    bg = "white"
+  )
+
+  message(sprintf("Hierarchical Dot Plot Success! Saved to: %s", file.path(dot_out_name)))
+  print(hier_dotplot)
+} else {
+  message("Skipping Visualization: No matching enrichment data available.") 
+}
+```
+
+
+
+
+
+TO DO:
+- add the additional annotation information formats used in the mahal distance

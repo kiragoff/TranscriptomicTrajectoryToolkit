@@ -40,50 +40,82 @@ library(patchwork)      # Combines multiple plots into grids (Tree-Heatmap layou
 
 ```{r}
 base_dir <- "./"
-base_results <- "./results"
-results_dir <- "./results/04-cluster-enrichment/go"
+base_results <- "./results2"
+results_dir <- "./results2/04-cluster-enrichment/go-qcheck"
 
 
-ifelse(!dir.exists(file.path(results_dir)),
-  dir.create(file.path(results_dir)),
-  "Directory Exists"
-)
+if (!dir.exists(results_dir)) {
+  dir.create(results_dir, recursive = TRUE)
+}
+
+
 ```
 
 
 #GO enrichment, specifically, because we have to fetch terms instead of reading from tsv
-
-```{r !!!go-enrichment}
+```{r}
 # ----- define variables -----
-qtable <- 0.6 # q threshold for out table
-ptable <- 0.2 # p threshold for out table
-clust_thresh <- 0.25 # cluster membership threshold
+qtable <- 0.3          # q threshold for out table (Updated to match reference)
+clust_thresh <- 0.25   # cluster membership threshold
+lfc_rescue <- 1        # Log2 Fold Change fallback rescue threshold
 
 target_db <- "GO_bak"
 
+# Keywords to filter out
+housekeeping_terms <- c(
+  "\\b5s\\b", "\\b16s\\b", "\\b23s\\b", 
+  "rrna", 
+  "ribosomal protein", 
+  "^ribosomal large subunit$", 
+  "^ribosomal small subunit$",
+  "sigma factor", "rna polymerase"
+)
 
 # Define background from detectable genes
 raw_universe_genes <- rownames(dds)
 
-# ----- mapping and enrichment -----
+# ----- mapping and universe definitions -----
 
-# Map genes to GO terms
-t2g <- anno_operon_clean %>%
+# 1. Split multi-term genes to one per row
+t2g_base <- anno_operon_clean %>%
   filter(Gene %in% raw_universe_genes) %>%
-  # Use dplyr:: explicitly here
   dplyr::select(!!sym(target_db), Gene) %>%
   drop_na(!!sym(target_db)) %>%
-  separate_rows(!!sym(target_db), sep = ", ") %>%
-  filter(!!sym(target_db) != "" & !!sym(target_db) != "NA") %>%
-  rename(term_id = !!sym(target_db), gene_id = Gene) %>%
+  separate_rows(!!sym(target_db), sep = ",\\s*")
+
+# 2. Extract unique GO terms to fetch descriptions from GO.db for housekeeping filters
+unique_raw_gos <- unique(t2g_base[[target_db]])
+
+library(GO.db)
+clean_defs <- AnnotationDbi::select(
+  x       = GO.db,
+  keys    = unique_raw_gos,
+  columns = c("GOID", "TERM"),
+  keytype = "GOID"
+) %>%
+  dplyr::rename(ID = GOID, Description = TERM) %>%
+  drop_na(Description)
+
+# 3. Filter out gene-term pairs matching housekeeping terms
+t2g <- t2g_base %>%
+  rename(ID = !!sym(target_db)) %>%
+  left_join(clean_defs, by = "ID") %>%
+  filter(!grepl(paste(housekeeping_terms, collapse = "|"), Description, ignore.case = TRUE)) %>%
+  select(term_id = ID, gene_id = Gene) %>%
+  filter(term_id != "" & term_id != "NA") %>%
   distinct()
+
+# Final clean background universe
 universe_vector <- unique(t2g$gene_id)
 
-# Run enrichment
+# ----- Cluster processing -----
+
 cluster_input <- df_final_clusters %>%
-  filter(is_driver == "High-Confidence" & Gene %in% universe_vector)
-#filter(membership_score >= clust_thresh & Gene %in% universe_vector)
+  filter(is_driver == "High-Confidence") %>% # Honors upstream dual-filtering rules
+  filter(Gene %in% universe_vector) %>%
+  select(Gene, cluster)
   
+n_clusters <- length(unique(cluster_input$cluster))
 all_clusters <- sort(unique(cluster_input$cluster))
 enrich_list <- list()
 
@@ -94,32 +126,33 @@ for (clust_id in all_clusters) {
     filter(cluster == clust_id) %>%
     pull(Gene)
 
-  ego <- enricher(
-    gene         = current_genes,
-    universe     = universe_vector,
-    TERM2GENE    = t2g,
-    pvalueCutoff = ptable,
-    qvalueCutoff = qtable,
-    minGSSize    = 2
-  )
+  if (length(intersect(current_genes, universe_vector)) > 0) {
+    ego <- enricher(
+      gene         = current_genes,
+      universe     = universe_vector,
+      TERM2GENE    = t2g,
+      pvalueCutoff = 1,
+      qvalueCutoff = qtable,
+      minGSSize    = 2,
+      maxGSSize    = 500
+    )
 
-  if (!is.null(ego) && nrow(ego@result) > 0) {
-    enrich_list[[as.character(clust_id)]] <- as.data.frame(ego) %>%
-      mutate(Analysis_Group = paste0("Cluster_", clust_id))
+    if (!is.null(ego) && nrow(ego@result) > 0) {
+      enrich_list[[as.character(clust_id)]] <- as.data.frame(ego) %>%
+        mutate(Analysis_Group = paste0("Cluster_", clust_id))
+    }
   }
 }
 
-# ----- make it sensible -----
-# lookup term definitions
-library(GO.db)
+# ----- Compile Outputs -----
 
 if (length(enrich_list) > 0) {
   all_go_res <- bind_rows(enrich_list)
   unique_go_ids <- unique(all_go_res$ID)
 
-  message("Mapping metadata for ", length(unique_go_ids), " unique GO terms...")
+  message("Mapping full metadata for metadata file generation...")
 
-  # Explicitly use AnnotationDbi for the database query
+  # Detailed definition lookup for the final output table
   go_metadata_df <- AnnotationDbi::select(
     x       = GO.db,
     keys    = unique_go_ids,
@@ -128,12 +161,9 @@ if (length(enrich_list) > 0) {
   ) %>%
     dplyr::rename(ID = GOID, GO_Name = TERM, GO_Definition = DEFINITION)
 
-# merge and save
   final_go_df <- all_go_res %>%
     dplyr::left_join(go_metadata_df, by = "ID")
 
-  # Force-verify that geneID exists before dropping columns, 
-  # or find its exact spelling if clusterProfiler output changed.
   if (!"geneID" %in% colnames(final_go_df) & "gene_id" %in% colnames(final_go_df)) {
     final_go_df <- final_go_df %>% dplyr::rename(geneID = gene_id)
   }
@@ -141,35 +171,35 @@ if (length(enrich_list) > 0) {
   final_go_df <- final_go_df %>%
     dplyr::select(
       dplyr::any_of(c(
-        "Analysis_Group","GO_Name", "ID", "GO_Definition",
+        "Analysis_Group", "GO_Name", "ID", "GO_Definition",
         "Count", "GeneRatio", "BgRatio", "pvalue",
         "p.adjust", "qvalue", "geneID"
       ))
     )
 
-  # Save locally
+  # Setup paths matching target database directory
+  base_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d", target_db, clust_thresh, lfc_rescue, n_clusters)
+  
   if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
-  out_path = file.path(results_dir, "go_anno_cluster_results.csv")
+  out_path <- file.path(results_dir, paste0(base_name, "_go_results.csv"))
+  
   write.csv(final_go_df, out_path, row.names = FALSE)
-
   message("GO Analysis complete. File saved to: ", out_path)
+  
 } else {
-  message("No significant GO enrichment found for these clusters.")
+  message(sprintf("No enrichment found for %s, %d clusters with current parameters.", target_db, n_clusters))
 }
 
-# RESET NAMESPACE,
-# Force R to point 'select' and 'filter' back to dplyr
+# Namespace safety resetting
 select <- dplyr::select
 filter <- dplyr::filter
-
-message("Namespace reset: 'select' and 'filter' now point back to dplyr.")
 ```
 
 
-```{r bubble-plot-all-clusters}
+```{#r bubble-plot-all-clusters}
 # ----- define variables -----
 qtable <- 0.3          # q threshold for output filtering
-ptable <- 0.05         # p threshold for output filtering
+
 clust_thresh <- 0.25   # cluster membership threshold
 target_db <- "GO_bak"
 
@@ -220,7 +250,7 @@ comp_ego <- compareCluster(
   universe     = universe_vector,
   TERM2GENE    = t2g,
   TERM2NAME    = t2n,
-  pvalueCutoff = ptable,
+  pvalueCutoff = 1,
   qvalueCutoff = qtable
 )
 
@@ -277,12 +307,129 @@ filter <- dplyr::filter
 message("Namespace reset: 'select' and 'filter' point back to dplyr.")
 ```
 
+
+```{r}
+# ----- define variables -----
+qtable <- 0.3          # q threshold for output filtering
+clust_thresh <- 0.25   # cluster membership threshold
+lfc_rescue <- 1        # ADDED: explicitly declare rescue metadata token
+target_db <- "GO_bak"
+
+# Define background universe from detectable genes
+raw_universe_genes <- rownames(dds)
+
+# ----- mapping -----
+
+# Map background genes to custom GO terms (UPDATED REGEX TO MATCH CHUNK 2)
+t2g <- anno_operon_clean %>%
+  filter(Gene %in% raw_universe_genes) %>%
+  dplyr::select(!!sym(target_db), Gene) %>%
+  drop_na(!!sym(target_db)) %>%
+  separate_rows(!!sym(target_db), sep = ",\\s*") %>% # Fix: space-flexible regex splitting
+  filter(!!sym(target_db) != "" & !!sym(target_db) != "NA") %>%
+  rename(term_id = !!sym(target_db), gene_id = Gene) %>%
+  distinct()
+
+universe_vector <- unique(t2g$gene_id)
+
+# Build a comprehensive TERM2NAME mapping table from GO.db
+message("Building global GO term-to-name lookup table...")
+all_go_ids_in_universe <- unique(t2g$term_id)
+
+t2n <- AnnotationDbi::select(
+  x       = GO.db,
+  keys    = all_go_ids_in_universe,
+  columns = c("GOID", "TERM"),
+  keytype = "GOID"
+) %>%
+  dplyr::rename(term_id = GOID, term_name = TERM) %>%
+  distinct()
+
+# ----- FIXED CLUSTER FILTERING -----
+# Ensuring the rescue threshold logic matches your accurate data profile
+cluster_input <- df_final_clusters %>%
+  filter(is_driver == "High-Confidence" & Gene %in% universe_vector) %>%
+  select(Gene, cluster) # Keep it lightweight
+
+# ----- simultaneous cluster enrichment -----
+message("Splitting genes into cluster list and initiating compareCluster...")
+
+# Format clusters into a clean, named list of gene vectors to avoid splitting errors
+gene_list_by_cluster <- split(cluster_input$Gene, cluster_input$cluster)
+
+# Run comparative enrichment across all groups concurrently
+comp_ego <- compareCluster(
+  geneClusters = gene_list_by_cluster, 
+  fun          = "enricher", 
+  universe     = universe_vector,
+  TERM2GENE    = t2g,
+  TERM2NAME    = t2n,
+  pvalueCutoff = 1,
+  qvalueCutoff = qtable
+)
+
+# ----- CORRECTED ONTOLOGY PATCH ---
+# Use attr() since 'ontology' is a core metadata attribute for compareClusterResult
+attr(comp_ego, "ontology") <- "BP"
+
+# ----- similarity matrix ----- 
+message("Calculating global semantic similarity matrix via Jaccard Coefficient...")
+
+# Calculate overlapping gene similarities across the whole uncollapsed dataset
+comp_ego_sim <- pairwise_termsim(comp_ego, method = "JC", semData = NULL)
+
+# ----- Visualization -----
+message("Collapsing redundant terms and plotting master comparative dotplot...")
+
+suppressWarnings({
+  # showCategory = 5 groups hundreds of terms into modules, displaying the top 5 per cluster
+  p_compare <- dotplot(comp_ego_sim, x = "Cluster", showCategory = 5) +
+    labs(
+      title = "Functional Mapping Across Analysis Groups",
+      subtitle = "Redundant terms collapsed dynamically; top modules compared side-by-side",
+      x = "Analysis Group (Cluster)",
+      y = "Enriched Functional Module"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      axis.text.y = element_text(fontsize = 9),
+      plot.title = element_text(face = "bold", size = 14)
+    )
+
+  # Ensure the results folder exists and write the comparative plot
+  if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+  
+  out_plot_path <- file.path(results_dir, "all_clusters_compared_dotplot.png")
+  ggsave(
+    filename = out_plot_path,
+    plot = p_compare, 
+    width = 15, 
+    height = 12, 
+    dpi = 300
+  )
+})
+
+
+message("Success! Master comparative bubble plot saved to: ", out_plot_path)
+
+print(p_compare)
+
+# ------ reset pointers -----
+select <- dplyr::select
+filter <- dplyr::filter
+message("Namespace reset: 'select' and 'filter' point back to dplyr.")
+```
+
+
+
+.
 Let's look at the drivers per cluster
 
 ```{r !!!go-enrichment-semantic-terminology-sep-trees}
 # ----- define variables -----
 qtable <- 0.3          # q threshold for out table
-ptable <- 0.05         # p threshold for out table
+
 clust_thresh <- 0.25   # cluster membership threshold
 target_db <- "GO_bak"
 
@@ -328,58 +475,90 @@ for (clust_id in all_clusters) {
     filter(cluster == clust_id) %>%
     pull(Gene)
 
-  ego <- enricher(
-    gene         = current_genes,
-    universe     = universe_vector,
-    TERM2GENE    = t2g,
-    TERM2NAME    = t2n,     
-    pvalueCutoff = ptable,
-    qvalueCutoff = qtable,
-    minGSSize    = 2
-  )
+  if (length(intersect(current_genes, universe_vector)) > 0) {
+    
+    # Run natively with standard stable alphanumeric tables
+    ego <- enricher(
+      gene         = current_genes,
+      universe     = universe_vector, 
+      TERM2GENE    = t2g,
+      pvalueCutoff = 1,
+      qvalueCutoff = qtable,
+      minGSSize    = 2,
+      maxGSSize    = 500
+    )
 
-  # Check if there are valid results before continuing
-  if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
-    
-    # Force 'BP' ontology so enrichplot doesn't choke on custom/generic objects
-    ego@ontology <- "BP" 
-    
-    # Use Jaccard Coefficient (JC) based on overlap matrix of custom genes
-    ego_sim <- pairwise_termsim(ego, method = "JC", semData = NULL)
-    
-    # Generate treeplot if there are enough terms to cluster (at least 2)
-    if (nrow(as.data.frame(ego)) > 1) {
+    if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
       
-      suppressWarnings({
-        p_tree <- treeplot(ego_sim, showCategory = 40) + 
-          labs(
-            title = paste0("Cluster ", clust_id, " GO Tree (Top 40 Terms)"),
-            subtitle = "Terms grouped by semantic similarity based on gene overlap"
+      ego@ontology <- "BP" 
+      ego_sim <- pairwise_termsim(ego, method = "JC", semData = NULL)
+      
+      n_terms <- nrow(as.data.frame(ego_sim))
+      
+      if (n_terms >= 3) {
+        target_groups <- if (n_terms < 5) (n_terms - 1) else 5
+        
+        suppressWarnings({
+          # 1. Generate the standard base treeplot
+          p_tree <- treeplot(
+            ego_sim, 
+            showCategory = 40, 
+            nCluster     = target_groups
           )
+          
+          # ====================================================================
+          # DYNAMIC DICTIONARY INTERCEPT (The Driver Filtering Fix)
+          # ====================================================================
+          # Directly query GO.db for whatever specific keys are present in this object
+          active_go_ids <- ego_sim@result$ID
+          
+          local_t2n <- AnnotationDbi::select(
+            x       = GO.db,
+            keys    = active_go_ids,
+            columns = c("GOID", "TERM"),
+            keytype = "GOID"
+          )
+          
+          # Build a pristine named lookup map unique to this specific runtime result
+          namemap <- setNames(local_t2n$TERM, local_t2n$GOID)
+          
+          # Swap the y-axis labels using the freshly queried terms
+          p_tree <- p_tree + 
+            scale_y_discrete(labels = function(x) {
+              ifelse(x %in% names(namemap), namemap[x], x)
+            }) +
+            labs(
+              title = paste0("Cluster ", clust_id, " GO Tree (Top 40 Terms)"),
+              subtitle = sprintf("Terms grouped by semantic similarity (%d modules colored)", target_groups)
+            ) +
+            theme(
+              axis.text.y = element_text(size = 9, face = "bold") 
+            )
+          # ====================================================================
+          
+          if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+          
+          base_plot_name <- sprintf("cluster_%s_%s_m%.2f-resc%.1f_treeplot.png", clust_id, target_db, clust_thresh, lfc_rescue)
+          ggsave(
+            filename = file.path(results_dir, base_plot_name), 
+            plot = p_tree, 
+            width = 18,     
+            height = 11, 
+            dpi = 300
+          )
+        })
         
-        # Ensure results directory exists before saving plots
-        if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
-        
-        ggsave(
-          filename = file.path(results_dir, paste0("cluster_", clust_id, "_treeplot.png")), 
-          plot = p_tree, 
-          width = 15,    
-          height = 11, 
-          dpi = 300
-        )
-      })
+        print(p_tree)
+      } else {
+        message(sprintf("Skipping treeplot for Cluster %s: Insufficient terms (%d found) for semantic clustering.", clust_id, n_terms))
+      }
       
-      # ----- ADDED PRINT STATEMENT ---
-      # Force-renders the treeplot directly inside your RStudio Plots panel / console
-      print(p_tree)
+      enrich_list[[as.character(clust_id)]] <- as.data.frame(ego) %>%
+        mutate(Analysis_Group = paste0("Cluster_", clust_id))
+        
+    } else {
+      message("No significant GO enrichment found passing thresholds for Cluster ", clust_id)
     }
-    
-    # Save text results to master dataframe list
-    enrich_list[[as.character(clust_id)]] <- as.data.frame(ego) %>%
-      mutate(Analysis_Group = paste0("Cluster_", clust_id))
-      
-  } else {
-    message("No significant GO enrichment found passing thresholds for Cluster ", clust_id)
   }
 }
 
@@ -440,6 +619,610 @@ filter <- dplyr::filter
 message("Namespace reset: 'select' and 'filter' point back to dplyr.")
 ```
 
+```{r !!!}
+# ----- define variables -----
+qtable <- 0.3          # q threshold for out table
+clust_thresh <- 0.25   # cluster membership threshold
+lfc_rescue <- 1        # ADDED: explicitly declare rescue metadata token
+target_db <- "GO_bak"
+
+# Keywords to filter out
+housekeeping_terms <- c(
+  "\\b5s\\b", "\\b16s\\b", "\\b23s\\b", 
+  "rrna", 
+  "ribosomal protein", 
+  "^ribosomal large subunit$", 
+  "^ribosomal small subunit$",
+  "sigma factor", "rna polymerase"
+)
+
+raw_universe_genes <- rownames(dds)
+
+# ----- mapping and universe definitions -----
+
+# 1. Split multi-term genes using the flexible space regex
+t2g_base <- anno_operon_clean %>%
+  filter(Gene %in% raw_universe_genes) %>%
+  dplyr::select(!!sym(target_db), Gene) %>%
+  drop_na(!!sym(target_db)) %>%
+  separate_rows(!!sym(target_db), sep = ",\\s*") # Fix: space-flexible splitting
+
+# 2. Extract unique GO terms to fetch descriptions for housekeeping filters
+unique_raw_gos <- unique(t2g_base[[target_db]])
+
+library(GO.db)
+clean_defs <- AnnotationDbi::select(
+  x       = GO.db,
+  keys    = unique_raw_gos,
+  columns = c("GOID", "TERM"),
+  keytype = "GOID"
+) %>%
+  dplyr::rename(ID = GOID, Description = TERM) %>%
+  drop_na(Description)
+
+# 3. Filter out gene-term pairs matching housekeeping terms
+t2g <- t2g_base %>%
+  rename(ID = !!sym(target_db)) %>%
+  left_join(clean_defs, by = "ID") %>%
+  filter(!grepl(paste(housekeeping_terms, collapse = "|"), Description, ignore.case = TRUE)) %>%
+  select(term_id = ID, gene_id = Gene) %>%
+  filter(term_id != "" & term_id != "NA") %>%
+  distinct()
+
+universe_vector <- unique(t2g$gene_id)
+
+message("Building GO ID to Term Name mapping table...")
+t2n <- clean_defs %>% 
+  rename(term_id = ID, term_name = Description) %>%
+  filter(term_id %in% universe_vector)
+
+# Prepare cluster inputs matching your correct upstream data profile
+cluster_input <- df_final_clusters %>%
+  filter(is_driver == "High-Confidence" & Gene %in% universe_vector) %>%
+  select(Gene, cluster)
+
+all_clusters <- sort(unique(cluster_input$cluster))
+n_clusters <- length(all_clusters)
+enrich_list <- list()
+
+message("Starting GO Enrichment for ", n_clusters, " clusters...")
+
+# ----- enrichment and visualization ---
+for (clust_id in all_clusters) {
+  current_genes <- cluster_input %>%
+    filter(cluster == clust_id) %>%
+    pull(Gene)
+
+  if (length(intersect(current_genes, universe_vector)) > 0) {
+    
+    # Run enricher natively with robust alphanumeric IDs
+    ego <- enricher(
+      gene         = current_genes,
+      universe     = universe_vector, 
+      TERM2GENE    = t2g,
+      TERM2NAME    = t2n,     
+      pvalueCutoff = 1,
+      qvalueCutoff = qtable,
+      minGSSize    = 2,
+      maxGSSize    = 500
+    )
+
+    # Check if there are valid results before continuing
+    if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
+      
+      ego@ontology <- "BP" 
+      
+      # Step 1: Calculate semantic matrix while slots match perfectly
+      ego_sim <- pairwise_termsim(ego, method = "JC", semData = NULL)
+      
+      # ========================================================================
+      # THE POST-STATISTICAL TREEPLOT SLOT INTERCEPT PATCH
+      # ========================================================================
+      # Build a direct mapping dictionary from the internal alphanumeric keys
+      raw_ids <- ego_sim@result$ID
+      matched_words <- t2n$term_name[match(raw_ids, t2n$term_id)]
+      final_clean_labels <- ifelse(!is.na(matched_words) & matched_words != "", matched_words, raw_ids)
+      
+      # Overwrite the visual description slots treeplot uses for text generation
+      ego_sim@result$Description <- final_clean_labels
+      ego_sim@result$ID          <- final_clean_labels
+      rownames(ego_sim@result)   <- final_clean_labels
+      
+      # Update the underlying similarity matrix labels so clustering coordinates align
+      if (!is.null(ego_sim@termsim)) {
+        rownames(ego_sim@termsim) <- final_clean_labels[match(rownames(ego_sim@termsim), raw_ids)]
+        colnames(ego_sim@termsim) <- final_clean_labels[match(colnames(ego_sim@termsim), raw_ids)]
+      }
+      # ========================================================================
+      
+      n_terms <- nrow(as.data.frame(ego_sim))
+      
+      if (n_terms >= 3) {
+        target_groups <- if (n_terms < 5) (n_terms - 1) else 5
+        
+        suppressWarnings({
+          p_tree <- treeplot(
+            ego_sim, 
+            showCategory = 40, 
+            nCluster     = target_groups
+          ) + 
+            labs(
+              title = paste0("Cluster ", clust_id, " GO Tree (Top 40 Terms)"),
+              subtitle = sprintf("Terms grouped by semantic similarity (%d modules colored)", target_groups)
+            ) +
+            theme(
+              axis.text.y = element_text(size = 9, face = "bold") 
+            )
+          
+          if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+          
+          base_plot_name <- sprintf("cluster_%s_%s_m%.2f-resc%.1f_treeplot.png", clust_id, target_db, clust_thresh, lfc_rescue)
+          ggsave(
+            filename = file.path(results_dir, base_plot_name), 
+            plot = p_tree, 
+            width = 18,     # Extra room for descriptive words
+            height = 11, 
+            dpi = 300
+          )
+        })
+        
+        print(p_tree)
+      } else {
+        message(sprintf("Skipping treeplot for Cluster %s: Insufficient terms (%d found) for semantic clustering.", clust_id, n_terms))
+      }
+      
+      # Append results using the stable original object data
+      enrich_list[[as.character(clust_id)]] <- as.data.frame(ego) %>%
+        mutate(Analysis_Group = paste0("Cluster_", clust_id))
+        
+    } else {
+      message("No significant GO enrichment found passing thresholds for Cluster ", clust_id)
+    }
+  }
+}
+# ----- metadata, merge, and output ---
+if (length(enrich_list) > 0) {
+  all_go_res <- bind_rows(enrich_list)
+  unique_go_ids <- unique(all_go_res$ID)
+
+  message("Mapping extra metadata for ", length(unique_go_ids), " unique GO terms...")
+
+  go_metadata_df <- AnnotationDbi::select(
+    x       = GO.db,
+    keys    = unique_go_ids,
+    columns = c("GOID", "TERM", "DEFINITION"),
+    keytype = "GOID"
+  ) %>%
+    dplyr::rename(ID = GOID, GO_Name = TERM, GO_Definition = DEFINITION)
+
+  final_go_df <- all_go_res %>%
+    dplyr::left_join(go_metadata_df, by = "ID")
+
+  if (!"geneID" %in% colnames(final_go_df) & "gene_id" %in% colnames(final_go_df)) {
+    final_go_df <- final_go_df %>% dplyr::rename(geneID = gene_id)
+  }
+
+  final_go_df <- final_go_df %>%
+    dplyr::select(
+      dplyr::any_of(c(
+        "Analysis_Group", "GO_Name", "ID", "GO_Definition",
+        "Count", "GeneRatio", "BgRatio", "pvalue",
+        "p.adjust", "qvalue", "geneID"
+      ))
+    )
+
+  if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+  base_csv_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_go_results.csv", target_db, clust_thresh, lfc_rescue, n_clusters)
+  out_path <- file.path(results_dir, base_csv_name)
+  write.csv(final_go_df, out_path, row.names = FALSE)
+
+  message("GO Analysis complete. File and plots successfully saved with descriptive text names.")
+  
+  cat("\n--- FINAL RESULTS DATAFRAME PREVIEW ---\n")
+  print(tibble::as_tibble(final_go_df), n = 20)
+  
+} else {
+  message("Process finished: No significant GO enrichment across any clusters.")
+}
+
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+```{r}
+# ----- define variables -----
+qtable <- 0.3          # q threshold for out table
+clust_thresh <- 0.25   # cluster membership threshold
+lfc_rescue <- 1        # ADDED: explicitly declare rescue metadata token
+target_db <- "GO_bak"
+
+# Keywords to filter out
+housekeeping_terms <- c(
+  "\\b5s\\b", "\\b16s\\b", "\\b23s\\b", 
+  "rrna", 
+  "ribosomal protein", 
+  "^ribosomal large subunit$", 
+  "^ribosomal small subunit$",
+  "sigma factor", "rna polymerase"
+)
+
+raw_universe_genes <- rownames(dds)
+
+# ----- mapping and universe definitions -----
+
+# 1. Split multi-term genes using the flexible space regex
+t2g_base <- anno_operon_clean %>%
+  filter(Gene %in% raw_universe_genes) %>%
+  dplyr::select(!!sym(target_db), Gene) %>%
+  drop_na(!!sym(target_db)) %>%
+  separate_rows(!!sym(target_db), sep = ",\\s*") 
+
+# 2. Extract unique GO terms to fetch descriptions for housekeeping filters
+unique_raw_gos <- unique(t2g_base[[target_db]])
+
+library(GO.db)
+clean_defs <- AnnotationDbi::select(
+  x       = GO.db,
+  keys    = unique_raw_gos,
+  columns = c("GOID", "TERM"),
+  keytype = "GOID"
+) %>%
+  dplyr::rename(ID = GOID, Description = TERM) %>%
+  drop_na(Description)
+
+# 3. Filter out gene-term pairs matching housekeeping terms
+t2g <- t2g_base %>%
+  rename(ID = !!sym(target_db)) %>%
+  left_join(clean_defs, by = "ID") %>%
+  filter(!grepl(paste(housekeeping_terms, collapse = "|"), Description, ignore.case = TRUE)) %>%
+  select(term_id = ID, gene_id = Gene) %>%
+  filter(term_id != "" & term_id != "NA") %>%
+  distinct()
+
+universe_vector <- unique(t2g$gene_id)
+
+message("Building GO ID to Term Name mapping table...")
+# CHANGE 1: Maintain structural names expected by enricher but bake in the combined layout
+t2n <- clean_defs %>% 
+  mutate(Combined_Label = sprintf("%s: %s", ID, Description)) %>%
+  select(ID, Description = Combined_Label) %>%
+  filter(ID %in% unique(t2g$term_id))
+
+# Prepare cluster inputs matching your correct upstream data profile
+cluster_input <- df_final_clusters %>%
+  filter(is_driver == "High-Confidence" & Gene %in% universe_vector) %>%
+  select(Gene, cluster)
+
+all_clusters <- sort(unique(cluster_input$cluster))
+n_clusters <- length(all_clusters)
+enrich_list <- list()
+
+message("Starting GO Enrichment for ", n_clusters, " clusters...")
+
+# ----- enrichment and visualization ---
+for (clust_id in all_clusters) {
+  current_genes <- cluster_input %>%
+    filter(cluster == clust_id) %>%
+    pull(Gene)
+
+  if (length(intersect(current_genes, universe_vector)) > 0) {
+    
+    # Run enricher natively with robust alphanumeric IDs
+    ego <- enricher(
+      gene         = current_genes,
+      universe     = universe_vector, 
+      TERM2GENE    = t2g,
+      TERM2NAME    = t2n,     
+      pvalueCutoff = 1,
+      qvalueCutoff = qtable,
+      minGSSize    = 2,
+      maxGSSize    = 500
+    )
+
+    # Check if there are valid results before continuing
+    if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
+      
+      ego@ontology <- "BP" 
+      
+      # Step 1: Calculate semantic matrix while slots match perfectly
+      ego_sim <- pairwise_termsim(ego, method = "JC", semData = NULL)
+      
+# ========================================================================
+      # THE POST-STATISTICAL TREEPLOT SLOT INTERCEPT PATCH (STREAMLINED)
+      # ========================================================================
+      # Build a direct mapping dictionary from the internal alphanumeric keys
+      raw_ids <- ego_sim@result$ID
+      matched_words <- t2n$Description[match(raw_ids, t2n$ID)] # Pulls "GOID: Description"
+      final_clean_labels <- ifelse(!is.na(matched_words) & matched_words != "", matched_words, raw_ids)
+      
+      # ONLY patch the Description slot. Treeplot reads this for text rendering,
+      # while everything else (ID, matrix dimensions) stays safely untouched.
+      ego_sim@result$Description <- final_clean_labels
+      # ========================================================================
+      n_terms <- nrow(as.data.frame(ego_sim))
+      
+      if (n_terms >= 3) {
+        target_groups <- if (n_terms < 5) (n_terms - 1) else 5
+        
+        suppressWarnings({
+          p_tree <- treeplot(
+            ego_sim, 
+            showCategory = 40, 
+            nCluster     = target_groups
+          ) + 
+            labs(
+              title = paste0("Cluster ", clust_id, " GO Tree (Top 40 Terms)"),
+              subtitle = sprintf("Terms grouped by semantic similarity (%d modules colored)", target_groups)
+            ) +
+            theme(
+              axis.text.y = element_text(size = 9, face = "bold") 
+            )
+          
+          if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+          
+          base_plot_name <- sprintf("cluster_%s_%s_m%.2f-resc%.1f_treeplot.png", clust_id, target_db, clust_thresh, lfc_rescue)
+          ggsave(
+            filename = file.path(results_dir, base_plot_name), 
+            plot = p_tree, 
+            width = 18,     # Extra room for descriptive words
+            height = 11, 
+            dpi = 300
+          )
+        })
+        
+        print(p_tree)
+      } else {
+        message(sprintf("Skipping treeplot for Cluster %s: Insufficient terms (%d found) for semantic clustering.", clust_id, n_terms))
+      }
+      
+      # Append results using the stable original object data
+      enrich_list[[as.character(clust_id)]] <- as.data.frame(ego) %>%
+        mutate(Analysis_Group = paste0("Cluster_", clust_id))
+        
+    } else {
+      message("No significant GO enrichment found passing thresholds for Cluster ", clust_id)
+    }
+  }
+}
+# ----- metadata, merge, and output ---
+if (length(enrich_list) > 0) {
+  all_go_res <- bind_rows(enrich_list)
+  unique_go_ids <- unique(all_go_res$ID)
+
+  message("Mapping extra metadata for ", length(unique_go_ids), " unique GO terms...")
+
+  go_metadata_df <- AnnotationDbi::select(
+    x       = GO.db,
+    keys    = unique_go_ids,
+    columns = c("GOID", "TERM", "DEFINITION"),
+    keytype = "GOID"
+  ) %>%
+    dplyr::rename(ID = GOID, GO_Name = TERM, GO_Definition = DEFINITION)
+
+  final_go_df <- all_go_res %>%
+    dplyr::left_join(go_metadata_df, by = "ID")
+
+  if (!"geneID" %in% colnames(final_go_df) & "gene_id" %in% colnames(final_go_df)) {
+    final_go_df <- final_go_df %>% dplyr::rename(geneID = gene_id)
+  }
+
+  final_go_df <- final_go_df %>%
+    dplyr::select(
+      dplyr::any_of(c(
+        "Analysis_Group", "GO_Name", "ID", "GO_Definition",
+        "Count", "GeneRatio", "BgRatio", "pvalue",
+        "p.adjust", "qvalue", "geneID"
+      ))
+    )
+
+  if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+  base_csv_name <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d_go_results.csv", target_db, clust_thresh, lfc_rescue, n_clusters)
+  out_path <- file.path(results_dir, base_csv_name)
+  write.csv(final_go_df, out_path, row.names = FALSE)
+
+  message("GO Analysis complete. File and plots successfully saved with descriptive text names.")
+  
+  cat("\n--- FINAL RESULTS DATAFRAME PREVIEW ---\n")
+  print(tibble::as_tibble(final_go_df), n = 20)
+  
+} else {
+  message("Process finished: No significant GO enrichment across any clusters.")
+}
+
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+
+
+```{r}
+# ==============================================================================
+# 0. GLOBAL DEFINITIONS & INPUT DATA SETTINGS
+# ==============================================================================
+qtable       <- 0.3      # q threshold for output filtering
+
+clust_thresh <- 0.25     # cluster membership threshold
+lfc_rescue   <- 1        # Log2 Fold Change fallback rescue threshold
+target_db    <- "GO_bak"
+
+housekeeping_terms <- c(
+  "\\b5s\\b", "\\b16s\\b", "\\b23s\\b", "rrna", "ribosomal protein", 
+  "^ribosomal large subunit$", "^ribosomal small subunit$", "sigma factor", "rna polymerase"
+)
+
+raw_universe_genes <- rownames(dds)
+
+# Map background genes to custom GO terms
+t2g_base <- anno_operon_clean %>%
+  filter(Gene %in% raw_universe_genes) %>%
+  dplyr::select(!!sym(target_db), Gene) %>%
+  drop_na(!!sym(target_db)) %>%
+  separate_rows(!!sym(target_db), sep = ",\\s*")
+
+unique_raw_gos <- unique(t2g_base[[target_db]])
+
+library(GO.db)
+clean_defs <- AnnotationDbi::select(
+  x       = GO.db,
+  keys    = unique_raw_gos,
+  columns = c("GOID", "TERM"),
+  keytype = "GOID"
+) %>%
+  dplyr::rename(ID = GOID, Description = TERM) %>%
+  drop_na(Description)
+
+t2g <- t2g_base %>%
+  rename(ID = !!sym(target_db)) %>%
+  left_join(clean_defs, by = "ID") %>%
+  filter(!grepl(paste(housekeeping_terms, collapse = "|"), Description, ignore.case = TRUE)) %>%
+  select(term_id = ID, gene_id = Gene) %>%
+  filter(term_id != "" & term_id != "NA") %>%
+  distinct()
+
+universe_vector <- unique(t2g$gene_id)
+
+# ==============================================================================
+# CORRECTED MAPPING & ENRICHMENT FOR NON-MODEL ORGANISMS
+# ==============================================================================
+
+# ==============================================================================
+# COMBINED GO ID AND DESCRIPTION MAPPING
+# ==============================================================================
+
+message("Building combined GO ID and Term Name mapping table...")
+t2n <- clean_defs %>% 
+  # Combine ID and Description into the expected Description slot
+  mutate(Combined_Label = sprintf("%s: %s", ID, Description)) %>%
+  select(ID, Description = Combined_Label) %>%
+  filter(ID %in% unique(t2g$term_id))
+
+cluster_input <- df_final_clusters %>%
+  filter(is_driver == "High-Confidence" & Gene %in% universe_vector) %>%
+  select(Gene, cluster)
+
+gene_list_by_cluster <- split(cluster_input$Gene, cluster_input$cluster)
+
+# Run standard comparative enrichment base tool
+comp_ego <- compareCluster(
+  geneClusters = gene_list_by_cluster, 
+  fun          = "enricher", 
+  universe     = universe_vector,
+  TERM2GENE    = t2g,
+  TERM2NAME    = t2n,  # Now contains "GOXXXXX: Functional Description"
+  pvalueCutoff = 1,
+  qvalueCutoff = qtable
+)
+attr(comp_ego, "ontology") <- "BP"
+
+# Establish target base directories
+if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+subfolder_dir <- file.path(results_dir, "reshaped_outputs")
+if (!dir.exists(subfolder_dir)) dir.create(subfolder_dir, recursive = TRUE)
+
+n_clusters <- length(unique(cluster_input$cluster))
+base_name  <- sprintf("%s_enrichment_m%.2f-resc%.1f_c%d", target_db, clust_thresh, lfc_rescue, n_clusters)
+
+# ==============================================================================
+# PIPELINE STREAM 1: COLLAPSED / SEMANTIC FUNCTIONAL MODULE OUTPUTS
+# ==============================================================================
+message("\n--- Executing Stream 1: Generating Semantically Collapsed Visualizations ---")
+
+comp_ego_sim <- pairwise_termsim(comp_ego, method = "JC", semData = NULL)
+
+suppressWarnings({
+  p_compare_collapsed <- dotplot(comp_ego_sim, x = "Cluster", showCategory = 5) +
+    labs(
+      title    = "Functional Mapping Across Analysis Groups",
+      subtitle = "Redundant terms collapsed dynamically into structural summary modules",
+      x        = "Analysis Group (Cluster)", y = "Enriched Functional Module"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      axis.text.y = element_text(fontsize = 9),
+      plot.title  = element_text(face = "bold", size = 14)
+    )
+
+  collapsed_plot_path <- file.path(results_dir, paste0(base_name, "_collapsed_modules_dotplot.png"))
+  ggsave(filename = collapsed_plot_path, plot = p_compare_collapsed, width = 15, height = 12, dpi = 300)
+})
+print(p_compare_collapsed)
+
+
+# ==============================================================================
+# PIPELINE STREAM 2: UNCOLLAPSED GRANULAR SPECIFIC GO TERM OUTPUTS
+# ==============================================================================
+message("\n--- Executing Stream 2: Generating Granular Uncollapsed Term Outputs ---")
+
+# Step A: Generate Granular Dotplot using the base uncollapsed object
+suppressWarnings({
+  p_compare_granular <- dotplot(comp_ego, x = "Cluster", showCategory = 5) +
+    labs(
+      title    = "Granular Functional Mapping Across Analysis Groups",
+      subtitle = "Redundant terms remain split; rendering explicit top terms per cluster",
+      x        = "Analysis Group (Cluster)", y = "Enriched Specific Functional Term"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      axis.text.y = element_text(fontsize = 9),
+      plot.title  = element_text(face = "bold", size = 14)
+    )
+
+  granular_plot_path <- file.path(results_dir, paste0(base_name, "_granular_specific_terms_dotplot.png"))
+  ggsave(filename = granular_plot_path, plot = p_compare_granular, width = 15, height = 12, dpi = 300)
+})
+print(p_compare_granular)
+
+# Step B: Export full uncollapsed text variations to matching data frames
+if (!is.null(comp_ego) && nrow(as.data.frame(comp_ego)) > 0) {
+  
+  final_enrichment_df <- as.data.frame(comp_ego) %>%
+    select(-any_of("Description")) %>%
+    left_join(clean_defs, by = "ID") %>%
+    select(Cluster, ID, Description, Count, everything())
+
+  # 1. Master long table
+  original_out_path <- file.path(results_dir, paste0(base_name, "_granular_results.tsv"))
+  write.table(final_enrichment_df, original_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+
+  # 2. Organized by cluster, then gene long format
+  tidy_long_df <- final_enrichment_df %>%
+    separate_rows(geneID, sep = "/") %>%
+    rename(Gene_ID = geneID) %>%
+    select(Cluster, Gene_ID, ID, Description, everything()) %>%
+    arrange(Cluster, Gene_ID, qvalue)
+
+  long_out_path <- file.path(subfolder_dir, paste0(base_name, "_granular_long_by_gene.tsv"))
+  write.table(tidy_long_df, long_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+
+  # 3. Binary presence/absence matrix tracking individual GO terms
+  matrix_wide_df <- final_enrichment_df %>%
+    mutate(Enriched = 1) %>%
+    select(ID, Description, Cluster, Enriched) %>%
+    distinct() %>%
+    pivot_wider(
+      names_from  = Cluster,
+      values_from = Enriched,
+      values_fill = 0
+    ) %>%
+    arrange(ID)
+
+  wide_out_path <- file.path(subfolder_dir, paste0(base_name, "_granular_cluster_profile_matrix.tsv"))
+  write.table(matrix_wide_df, wide_out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+
+  message("Success! Exported uncollapsed granular term datasets:")
+  message(sprintf("  -> Original Table: %s", basename(original_out_path)))
+  message(sprintf("  -> Long Tidy: %s", file.path("reshaped_outputs", basename(long_out_path))))
+  message(sprintf("  -> Wide Profile Matrix: %s", file.path("reshaped_outputs", basename(wide_out_path))))
+}
+
+# ------ Reset Namespace Pointers -----
+select <- dplyr::select
+filter <- dplyr::filter
+message("Namespace reset completed successfully.")
+```
+
 
 # !!! ELIM
 
@@ -489,11 +1272,11 @@ run_tiered_ontology <- function(current_cluster, ontology_branch) {
       Analysis_Group = paste0("Cluster_", current_cluster),
       Ontology = ifelse(ontology_branch == "BP", "Biological Process", "Molecular Function"),
       # Clean character p-values (e.g., "< 1e-30") to numeric values
-      p.adjust = as.numeric(gsub("< ", "", Elim_p))
+      qvalue = as.numeric(gsub("< ", "", Elim_p))
     ) %>%
-    filter(p.adjust <= 0.05) %>% # Keep terms that survived decorrelation
+    filter(qvalue <= 0.05) %>% # Keep terms that survived decorrelation
     dplyr::rename(ID = GO.ID, GO_Name = Term) %>%
-    dplyr::select(Analysis_Group, ID, GO_Name, Ontology, p.adjust, Significant)
+    dplyr::select(Analysis_Group, ID, GO_Name, Ontology, qvalue, Significant)
 }
 ```
 
@@ -544,7 +1327,7 @@ Split the biological processes terms and molecular function terms for plotting
 # ----- filter and mutate data -----
 bp_base_data <- compiled_elim_results %>%
   filter(Ontology == "Biological Process") %>%
-  mutate(neg_log_p = -log10(p.adjust))
+  mutate(neg_log_p = -log10(qvalue))
 
 # theme to share across plots
 shared_theme <- theme_minimal(base_size = 10) +
@@ -646,7 +1429,7 @@ potential colour combinations: steelblue1-purple, deepskyblue-magenta4, gold2-cy
 # ----- filter and mutate -----
 mf_base_data <- compiled_elim_results %>%
   filter(Ontology == "Molecular Function") %>%
-  mutate(neg_log_p = -log10(p.adjust))
+  mutate(neg_log_p = -log10(qvalue))
 
 # Common theme to share across plots
 shared_theme <- theme_minimal(base_size = 11) +
@@ -769,7 +1552,7 @@ for (group_id in all_analysis_groups) {
   
   cluster_base_data <- compiled_elim_results %>%
     filter(Analysis_Group == group_id) %>%
-    mutate(neg_log_p = -log10(p.adjust))
+    mutate(neg_log_p = -log10(qvalue))
   
   if (nrow(cluster_base_data) == 0) {
     message("  Skipping: No enrichment records found for ", group_id)
@@ -779,7 +1562,7 @@ for (group_id in all_analysis_groups) {
   # ----- significance-weighted word cloud -----
   tryCatch({
     word_counts <- cluster_base_data %>%
-      filter(p.adjust <= 0.05) %>%
+      filter(qvalue <= 0.05) %>%
       dplyr::select(GO_Name, neg_log_p) %>%
       unnest_tokens(word, GO_Name) %>%
       anti_join(stop_words, by = "word") %>%
@@ -965,7 +1748,7 @@ for (group_id in all_analysis_groups) {
         
         net_terms <- compiled_elim_results %>%
           filter(Analysis_Group == group_id) %>%
-          mutate(neg_log_p = -log10(p.adjust)) %>%
+          mutate(neg_log_p = -log10(qvalue)) %>%
           slice_max(order_by = neg_log_p, n = 10, with_ties = FALSE)
       } else {
         full_name <- ifelse(variant == "BP", "Biological Process", "Molecular Function")
@@ -973,7 +1756,7 @@ for (group_id in all_analysis_groups) {
         
         net_terms <- compiled_elim_results %>%
           filter(Analysis_Group == group_id & Ontology_Branch == variant) %>%
-          mutate(neg_log_p = -log10(p.adjust)) %>%
+          mutate(neg_log_p = -log10(qvalue)) %>%
           slice_max(order_by = neg_log_p, n = 10, with_ties = FALSE)
       }
       
@@ -1060,7 +1843,7 @@ if (!dir.exists(sub_plots_dir)) dir.create(sub_plots_dir, recursive = TRUE)
 # Prepare universal high-resolution metric baseline
 raw_high_res_df <- compiled_elim_results %>%
   mutate(
-    neg_log_p = -log10(p.adjust),
+    neg_log_p = -log10(qvalue),
     Wrapped_GO_Name = str_wrap(as.character(GO_Name), width = 40)
   )
 
@@ -1218,7 +2001,7 @@ print(plot_fig1)
 ggsave(file.path(sub_plots_dir, "figure_1_bcaa_and_cyclic.pdf"), plot = plot_fig1, width = 9, height = h1, units = "in")
 ```
 
-```{r}
+```{r TODO-FIX-THIS}
 # ----- fig 3 v
 message("Generating Figure 3 (Figure 1 + Other Amino Acids with General Structural Terms)...")
 
@@ -1281,7 +2064,7 @@ ggsave(file.path(sub_plots_dir, "figure_3_expanded_amino_landscape.png"), plot =
 message("All three distinct figures have been processed and saved successfully.")
 ```
 
-```{r clustered-axes-aa}
+```{r TODO-FIX_THIS-clustered-axes-aa}
 
 
 # Ensure results directory exists
@@ -1406,7 +2189,7 @@ if (!dir.exists(lipid_plots_dir)) dir.create(lipid_plots_dir, recursive = TRUE)
 # Prepare base dataset metrics
 raw_lipid_df <- compiled_elim_results %>%
   mutate(
-    neg_log_p = -log10(p.adjust),
+    neg_log_p = -log10(qvalue),
     Wrapped_GO_Name = str_wrap(as.character(GO_Name), width = 40)
   )
 
@@ -1513,3 +2296,6 @@ ggsave(file.path(lipid_plots_dir, "figure_5_lipid_catabolism_and_armor.pdf"), pl
 message("Lipid subcategory pipeline executed. Figures 4 and 5 saved.")
 ```
 
+TO DO:
+- add the additional annotation information formats used in the mahal distance
+- fix cluster selection parameters

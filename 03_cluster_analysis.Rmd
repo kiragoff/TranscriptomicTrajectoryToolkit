@@ -41,8 +41,8 @@ library(knitr)
 
 ```{r pre-cleanup}
 base_dir <- "./"
-base_results <- "./results"
-results_dir <- "./results/03-clustering"
+base_results <- "./results2"
+results_dir <- "./results2/03-clustering"
 
 ifelse(!dir.exists(file.path(results_dir)),
   dir.create(file.path(results_dir)),
@@ -606,7 +606,7 @@ write.csv(df_toxic_responders, file.path(results_dir,"mahal_95_outliers.csv"))
 
 
 
-
+# --- cut this here ---
 
 
 

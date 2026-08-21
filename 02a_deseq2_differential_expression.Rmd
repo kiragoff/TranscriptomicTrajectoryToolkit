@@ -41,7 +41,11 @@ library(pcaExplorer)
 ```{r define-directories}
 base_dir <- "./"
 import_dir <- "./kallisto"
-results_dir <- "./results"
+results_dir <- "./results2"
+ifelse(!dir.exists(file.path(results_dir)),
+  dir.create(file.path(results_dir)),
+  "Directory Exists"
+)
 ```
 
 
