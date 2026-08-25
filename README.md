@@ -2,7 +2,7 @@
 
 An end-to-end, modular R and Bash pipeline designed for comprehensive transcriptomic data analysis, gene expression trajectory clustering, and interactive visualization. 
 
-This repository is a workflow of end-to-end analysis of a complex, multi time point, multi-condition RNASeq experiment. It covers everything from QC of rawa data through differential expression tests with DESeq2 or sleuth, utilizes fuzzy clustering of trajectory-based DE data and Mahalanobis outliers, through functional enrichment and gene set enrichment analysis, and a deployed interactive Shiny application for exploratory data analysis.
+This repository is a workflow of end-to-end analysis of a complex, multi time point, multi-condition RNASeq experiment. It covers everything from QC of raw data through differential expression tests with DESeq2 or sleuth, utilizes fuzzy clustering of trajectory-based DE data and Mahalanobis outliers, through functional enrichment and gene set enrichment analysis, and a deployed interactive Shiny application for exploratory data analysis.
 
 ## Pipeline Workflow
 
