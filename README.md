@@ -11,3 +11,14 @@ This repository is a workflow of end-to-end analysis of a complex, multi time po
 3. **Clustering & Trajectory Analysis (`03` - `05`):** Grouping genes by expression patterns over trajectories, utilizing distance metrics like Mahalanobis distance to model relationships and track trends.
 4. **Functional Enrichment (`04a` - `04b`, `06`):** Automated cluster profiling, Gene Ontology (GO), COG, and KEGG pathway enrichment frameworks.
 5. **Advanced Visualization & Interactive Dashboard (`07` - `10`):** Additional, publication-ready static plots, custom faceting, interactive `plotly` implementations, and a dedicated `Shiny` web application for dynamic exploration.
+
+## Example Figures
+
+<img src=https://github.com/kiragoff/TranscriptomicTrajectoryToolkit/blob/main/figures/volcano-res_24h_exposure-qval_0.05-lfc_1.png>
+
+<img src = https://github.com/kiragoff/TranscriptomicTrajectoryToolkit/blob/main/figures/mahalanobis_0.95.png>
+
+<img src = https://github.com/kiragoff/TranscriptomicTrajectoryToolkit/blob/main/figures/COG_cat_enrichment_m0.25-resc1.0_c9_hierarchical_dotplot.png>
+<img src = https://github.com/kiragoff/TranscriptomicTrajectoryToolkit/blob/main/figures/figure_1_bcaa_and_cyclic-1.png>
+
+<img src = https://github.com/kiragoff/TranscriptomicTrajectoryToolkit/blob/main/figures/Cluster_8_BP_cnetplot.png>
