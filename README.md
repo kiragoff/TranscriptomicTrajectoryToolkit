@@ -13,17 +13,17 @@ This repository is a workflow of end-to-end analysis of a complex, multi time po
 5. **Advanced Visualization & Interactive Dashboard (`07` - `10`):** Additional, publication-ready static plots, custom faceting, interactive `plotly` implementations, and a dedicated `Shiny` web application for dynamic exploration.
 
 ## Example Figures
-### Volcano 
+#### Volcano:
 <img src=https://github.com/kiragoff/TranscriptomicTrajectoryToolkit/blob/main/figures/volcano-res_24h_exposure-qval_0.05-lfc_1.png>
 
-### Fuzzy cluster Mahalanobis outliers
+#### Fuzzy cluster Mahalanobis outliers:
 <img src = https://github.com/kiragoff/TranscriptomicTrajectoryToolkit/blob/main/figures/mahalanobis_0.95.png>
 
-### COG category enrichment hierarchical dotplot
+#### COG category enrichment hierarchical dotplot:
 <img src = https://github.com/kiragoff/TranscriptomicTrajectoryToolkit/blob/main/figures/COG_cat_enrichment_m0.25-resc1.0_c9_hierarchical_dotplot.png>
 
-### Heatmap of enrichment of cyclic and branched chain amino acid GO processes
+#### Heatmap of enrichment of cyclic and branched chain amino acid GO processes:
 <img src = https://github.com/kiragoff/TranscriptomicTrajectoryToolkit/blob/main/figures/figure_1_bcaa_and_cyclic-1.png>
 
-### cnetplot of enriched GO processes in a single cluster
+#### cnetplot of enriched GO processes in a single cluster:
 <img src = https://github.com/kiragoff/TranscriptomicTrajectoryToolkit/blob/main/figures/Cluster_8_BP_cnetplot.png>
