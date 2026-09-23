@@ -10,7 +10,7 @@ This repository is a workflow of end-to-end analysis of a complex, multi time po
 
 This pipeline is **deliberately designed as a step-by-step interactive workflow** (scripts `01` through `10`) rather than a black-box automated wrapper. It is customizable to your experimental design. 
 
-Because transcriptomic trajectories, fuzzy clustering parameters, and Mahalanobis distance thresholds require careful interpretation of underlying statistical assumptions, each stage is meant to be run interactively. You'll always want to use your own data outputs to select what to focus on for the more detailed figures. 
+Because transcriptomic trajectories, fuzzy clustering parameters, and Mahalanobis distance thresholds require careful interpretation of underlying statistical assumptions, each stage is meant to be run interactively. You'll also want to use your own data outputs to select what to focus on for the more detailed figures. 
 
 To explore the analysis:
 1. Start at `01_qc_and_quantification.sh` and follow the numerical sequence.
